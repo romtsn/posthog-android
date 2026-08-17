@@ -1,5 +1,29 @@
 ## Next
 
+## 3.58.3
+
+### Patch Changes
+
+- b4e79ff: Add opt-in mask-alignment verification for session replay screenshots. Set `sessionReplayConfig.verifyScreenshotMaskAlignment` to `true` to capture continuously animated screens that the default redraw guard may discard, including screens with indeterminate spinners, animated GIFs, Lottie, Material progress indicators, and Compose infinite animations.
+
+  - Draw-dirty tracking is scoped per window, so a redraw in one window does not affect another window's capture.
+  - When enabled, mask rects are sampled before and after the pixel copy. A redrawn frame is kept only when the rects remain identical, no layout pass ran, and both walks completed with trustworthy geometry.
+  - Mask verification fails closed when a rendered view cannot be placed, the Compose semantics pass times out, or PixelCopy times out before masks are painted.
+
+## 3.58.2
+
+### Patch Changes
+
+- 71b632d: Fix: opting back in now re-arms push notifications without an app restart. After a logout unregister clears the device token, `optIn()` refetches the FCM token and re-registers the device (when `capturePushNotificationSubscriptions` is enabled) instead of only restoring consent (#675).
+
+  Adds a public `PostHogOptInReceiver` interface that integrations can implement to be notified when the user opts back in via `optIn()`.
+
+## 3.58.1
+
+### Patch Changes
+
+- 7825f07: Fix: opting out no longer strands an in-flight push unregister. The unregister `DELETE` is data removal, so it now completes even after `setOptOut(true)` instead of leaving the server-side subscription active for the whole opted-out period (#675).
+
 ## 3.58.0
 
 ### Minor Changes

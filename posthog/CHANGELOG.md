@@ -1,5 +1,25 @@
 ## Next
 
+## 6.31.0
+
+### Minor Changes
+
+- 0aeab4e: Support the `starts_with`, `not_starts_with`, `ends_with`, and `not_ends_with` property-filter operators in local feature flag evaluation. Both the property value and filter value are stringified and ASCII case-folded before the prefix/suffix comparison; the `not_*` variants negate the result. Flags targeting on these operators previously could not be evaluated locally and always fell back to remote evaluation.
+
+## 6.30.0
+
+### Minor Changes
+
+- 71b632d: Fix: opting back in now re-arms push notifications without an app restart. After a logout unregister clears the device token, `optIn()` refetches the FCM token and re-registers the device (when `capturePushNotificationSubscriptions` is enabled) instead of only restoring consent (#675).
+
+  Adds a public `PostHogOptInReceiver` interface that integrations can implement to be notified when the user opts back in via `optIn()`.
+
+## 6.29.2
+
+### Patch Changes
+
+- 7825f07: Fix: opting out no longer strands an in-flight push unregister. The unregister `DELETE` is data removal, so it now completes even after `setOptOut(true)` instead of leaving the server-side subscription active for the whole opted-out period (#675).
+
 ## 6.29.1
 
 ### Patch Changes
