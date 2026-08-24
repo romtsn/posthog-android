@@ -1,5 +1,65 @@
 ## Next
 
+## 3.60.4
+
+### Patch Changes
+
+- 8773f4d: Fix: `close()` now flushes pending events before tearing down the queue, so events captured shortly before shutdown are no longer left stranded until the SDK is re-initialized. Also fixes `PostHogMemoryQueue.flush()` (used by `posthog-server`) to dispatch on the queue's executor instead of running synchronously on the caller's thread, so it can no longer race ahead of an in-flight `add()` and see an empty queue.
+
+## 3.60.3
+
+### Patch Changes
+
+- 34e90b5: Fix `beforeSend` hook chaining so each hook receives the previous hook's output.
+
+## 3.60.2
+
+### Patch Changes
+
+- 4fd466a: `PostHogStateless` now builds every `$exception` event through a single internal route
+  (`captureExceptionEvent`), which `captureExceptionStateless` delegates to. The route owns the
+  `errorTrackingConfig.ignoredExceptionTypes` prefilter, the coerce-then-merge property order and the
+  personless distinct-id fallback, and it can carry the event fields `captureExceptionStateless`
+  cannot express (groups, an explicit timestamp), so SDK layers that need those no longer have to
+  re-implement the pre-capture steps and drift from the guarded path. Caller properties are supplied
+  as a provider that runs only after the enabled/opt-out and ignore-list gates pass, so expensive
+  enrichment is never computed for an event that is about to be dropped. `$exception` events carry no
+  person properties: they are ingested by a separate error-tracking pipeline with no ordering
+  guarantee against the person pipeline, so `$set`/`$set_once` are dropped server-side. Capture
+  behavior is unchanged; the addition is internal (`@PostHogInternal`) and visible only because of
+  the multi-module architecture.
+
+## 3.60.1
+
+### Patch Changes
+
+- 3e09338: Skip push token registration when the project has no push integration for the app_id, using the `push.appIds` list published in remote config. A device whose project configures push later re-registers on the next config load rather than staying unreachable.
+
+## 3.60.0
+
+### Minor Changes
+
+- 470c1fa: Add native (NDK) crash capture on Android 12+, opt-in via `errorTrackingConfig.captureNativeCrashes`. On startup the SDK reads the native crash records the OS kept (`ApplicationExitInfo` tombstones) and captures an `$exception` event per crash with raw native stack frames and `$debug_images`, so PostHog symbolicates them against `.so` debug symbols uploaded with `posthog-cli symbol-sets upload`.
+
+## 3.59.0
+
+### Minor Changes
+
+- 34b1647: Release the shared `ThrowableCoercer` error-tracking improvements (shipped in core 6.32.0, PostHog/posthog-android#669) in the Android and server artifacts:
+
+  - Each `$exception_list` item's mechanism now carries `exception_id` (0-based position); cause items get `parent_id` and mechanism `type: "chained"`, suppressed exceptions (`Throwable.suppressed`) are serialized with mechanism `type: "suppressed"` and the holder's `parent_id`. A single-item list carries no ids, matching the other SDKs. The ids are emitted on the wire for cross-SDK parity; PostHog ingestion does not persist them yet.
+  - Caps: at most 50 items per `$exception_list` and 64 frames per stacktrace (keeps the frames nearest the crash); the cap bounds the traversal itself.
+  - Compiler-generated frames (JVM and Kotlin lambdas, Android D8/R8 desugared lambdas and outlines, Spring CGLIB proxies, reflection accessors, dynamic proxies) are flagged with `method_synthetic: true` rather than dropped.
+  - New `PostHogErrorTrackingConfig.inAppExcludes` to force frames out of `in_app` (excludes win over `inAppIncludes`); matching happens against runtime class names before symbolication.
+
+  All field/key names and `platform: "java"` are unchanged; the additions are backwards compatible on the wire.
+
+## 3.58.4
+
+### Patch Changes
+
+- 7efc609: Clarify that event timestamps are serialized in UTC, and make session replay log timestamp handling more robust by parsing timezone-independent logcat epoch timestamps instead of local wall-clock timestamps.
+
 ## 3.58.3
 
 ### Patch Changes

@@ -1,5 +1,73 @@
 ## Next
 
+## 6.33.5
+
+### Patch Changes
+
+- 8773f4d: Fix: `close()` now flushes pending events before tearing down the queue, so events captured shortly before shutdown are no longer left stranded until the SDK is re-initialized. Also fixes `PostHogMemoryQueue.flush()` (used by `posthog-server`) to dispatch on the queue's executor instead of running synchronously on the caller's thread, so it can no longer race ahead of an in-flight `add()` and see an empty queue.
+
+## 6.33.4
+
+### Patch Changes
+
+- 34e90b5: Fix `beforeSend` hook chaining so each hook receives the previous hook's output.
+
+## 6.33.3
+
+### Patch Changes
+
+- 4fd466a: `PostHogStateless` now builds every `$exception` event through a single internal route
+  (`captureExceptionEvent`), which `captureExceptionStateless` delegates to. The route owns the
+  `errorTrackingConfig.ignoredExceptionTypes` prefilter, the coerce-then-merge property order and the
+  personless distinct-id fallback, and it can carry the event fields `captureExceptionStateless`
+  cannot express (groups, an explicit timestamp), so SDK layers that need those no longer have to
+  re-implement the pre-capture steps and drift from the guarded path. Caller properties are supplied
+  as a provider that runs only after the enabled/opt-out and ignore-list gates pass, so expensive
+  enrichment is never computed for an event that is about to be dropped. `$exception` events carry no
+  person properties: they are ingested by a separate error-tracking pipeline with no ordering
+  guarantee against the person pipeline, so `$set`/`$set_once` are dropped server-side. Capture
+  behavior is unchanged; the addition is internal (`@PostHogInternal`) and visible only because of
+  the multi-module architecture.
+
+## 6.33.2
+
+### Patch Changes
+
+- e37fd6a: Fix `onFeatureFlags` not running when the internal flags-loaded callback throws
+
+## 6.33.1
+
+### Patch Changes
+
+- 3e09338: Skip push token registration when the project has no push integration for the app_id, using the `push.appIds` list published in remote config. A device whose project configures push later re-registers on the next config load rather than staying unreachable.
+
+## 6.33.0
+
+### Minor Changes
+
+- 470c1fa: Add native (NDK) crash capture on Android 12+, opt-in via `errorTrackingConfig.captureNativeCrashes`. On startup the SDK reads the native crash records the OS kept (`ApplicationExitInfo` tombstones) and captures an `$exception` event per crash with raw native stack frames and `$debug_images`, so PostHog symbolicates them against `.so` debug symbols uploaded with `posthog-cli symbol-sets upload`.
+
+## 6.32.0
+
+### Minor Changes
+
+- f8ba0f2: Completes the exception-item model in the shared `ThrowableCoercer`:
+
+  - Each `$exception_list` item's mechanism now carries `exception_id` (0-based position); cause items get `parent_id` and mechanism `type: "chained"`, the primary item keeps its existing type. A single-item list carries no ids, matching the other SDKs. The chain metadata is emitted on the wire; persisting the relationships requires the PostHog-side mechanism-schema change (in flight), which today drops the ids on ingestion.
+  - Suppressed exceptions (`Throwable.suppressed`) are serialized with mechanism `type: "suppressed"` and the holder's `parent_id`.
+  - Caps: at most 50 items per `$exception_list` and 64 frames per stacktrace (keeps the frames nearest the crash). The 50-item cap bounds the traversal itself, so a pathological cause chain cannot be walked without limit.
+  - Compiler-generated frames (JVM and Kotlin lambdas, Android D8/R8 desugared lambdas and outlines, Spring CGLIB proxies, reflection accessors, dynamic proxies) are flagged with `method_synthetic: true` rather than dropped.
+  - New `PostHogErrorTrackingConfig.inAppExcludes` to force frames out of `in_app` (excludes win over `inAppIncludes`). Matching happens against runtime class names before symbolication, so on minified (ProGuard/R8) builds excludes generally will not match and server-side deobfuscation may reclassify frames afterwards; a deobfuscation-aware in-app contract is a follow-up.
+
+  All field/key names and `platform: "java"` are unchanged; the additions are backwards compatible on the wire.
+
+## 6.31.1
+
+### Patch Changes
+
+- 7efc609: Clarify that event timestamps are serialized in UTC, and make session replay log timestamp handling more robust by parsing timezone-independent logcat epoch timestamps instead of local wall-clock timestamps.
+- b1c2130: Support fractional rollout percentages when evaluating feature flags locally.
+
 ## 6.31.0
 
 ### Minor Changes

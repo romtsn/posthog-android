@@ -81,7 +81,7 @@ public sealed interface PostHogInterface {
      * @param userProperties the user properties, set as a "$set" property, Docs https://posthog.com/docs/product-analytics/user-properties
      * @param userPropertiesSetOnce the user properties to set only once, set as a "$set_once" property, Docs https://posthog.com/docs/product-analytics/user-properties
      * @param groups the groups, set as a "$groups" property, Docs https://posthog.com/docs/product-analytics/group-analytics
-     * @param timestamp the timestamp for the event
+     * @param timestamp the event timestamp override. UTC is preferred; the equivalent instant is serialized in UTC
      * @param appendFeatureFlags when true, enriches the event with feature flag properties
      * @param flags optional pre-resolved snapshot from [evaluateFlags]; when supplied, attaches
      *   `$feature/<key>` and `$active_feature_flags` from the snapshot without making another
@@ -109,7 +109,7 @@ public sealed interface PostHogInterface {
      * @param userProperties the user properties, set as a "$set" property
      * @param userPropertiesSetOnce the user properties to set only once, set as a "$set_once" property
      * @param groups the groups, set as a "$groups" property
-     * @param timestamp the timestamp for the event
+     * @param timestamp the event timestamp override. UTC is preferred; the equivalent instant is serialized in UTC
      * @param appendFeatureFlags when true, enriches the event with feature flag properties
      * @param flags optional pre-resolved snapshot from [evaluateFlags]
      */
@@ -815,6 +815,58 @@ public sealed interface PostHogInterface {
             exception,
             null,
             null,
+        )
+    }
+
+    /**
+     * Captures an exception
+     * Docs https://posthog.com/docs/error-tracking
+     * @param exception the exception to capture
+     * @param distinctId the distinctId. When null or blank, the current [PostHogRequestContext]
+     *   distinct ID is used; if none exists, a personless UUID is generated.
+     * @param options capture options containing properties, groups, timestamp, and feature flag
+     *   snapshot settings. Reserved exception properties such as `$exception_level` can be
+     *   overridden via the options properties.
+     *
+     * `$exception` events do not perform person updates: they are ingested by a separate
+     * error-tracking pipeline with no ordering guarantee against the person pipeline, so
+     * `$set`/`$set_once` are dropped server-side. The SDK therefore does not send them for an
+     * exception: `options.userProperties` is honoured only as person-property input for
+     * `appendFeatureFlags` flag evaluation, and `options.userPropertiesSetOnce` is ignored here.
+     * Set person properties with `capture` or `identify` instead.
+     *
+     * Java callers passing an explicit untyped `null` third argument must cast it
+     * (`captureException(e, id, (Map<String, Object>) null)`) since it now matches both this
+     * overload and the properties one.
+     */
+    public fun captureException(
+        exception: Throwable,
+        distinctId: String?,
+        options: PostHogCaptureOptions,
+    )
+
+    /**
+     * Captures an exception using the current [PostHogRequestContext] distinct ID, or as a
+     * personless event when no request context identity is active.
+     * Docs https://posthog.com/docs/error-tracking
+     * @param exception the exception to capture
+     * @param options capture options containing properties, groups, timestamp, and feature flag
+     *   snapshot settings
+     *
+     * `$exception` events do not perform person updates: they are ingested by a separate
+     * error-tracking pipeline with no ordering guarantee against the person pipeline, so
+     * `$set`/`$set_once` are dropped server-side. The SDK therefore does not send them for an
+     * exception: `options.userProperties` is honoured only as person-property input for
+     * `appendFeatureFlags` flag evaluation.
+     */
+    public fun captureException(
+        exception: Throwable,
+        options: PostHogCaptureOptions,
+    ) {
+        captureException(
+            exception,
+            null,
+            options,
         )
     }
 }

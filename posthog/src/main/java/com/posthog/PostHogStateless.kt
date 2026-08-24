@@ -12,6 +12,7 @@ import com.posthog.internal.PostHogPreferences.Companion.OPT_OUT
 import com.posthog.internal.PostHogPrintLogger
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogThreadFactory
+import com.posthog.internal.errortracking.PostHogThrowable
 import com.posthog.internal.errortracking.ThrowableCoercer
 import java.util.Date
 import java.util.UUID
@@ -109,6 +110,9 @@ public open class PostHogStateless protected constructor(
                 if (!isEnabled()) {
                     return
                 }
+
+                // flush pending events before tearing down so queued data isn't lost
+                queue?.flush()
 
                 enabled = false
 
@@ -301,17 +305,18 @@ public open class PostHogStateless protected constructor(
                 properties = sanitizedProperties,
                 timestamp = timestamp ?: config?.dateProvider?.currentDate() ?: Date(),
             )
-        var eventChecked: PostHogEvent? = postHogEvent
+        var eventChecked: PostHogEvent = postHogEvent
 
         val beforeSendList = config?.beforeSendList ?: emptyList()
 
         for (beforeSend in beforeSendList) {
             try {
-                eventChecked = beforeSend.run(postHogEvent)
-                if (eventChecked == null) {
+                val result = beforeSend.run(eventChecked)
+                if (result == null) {
                     config?.logger?.log("Event $event was rejected in beforeSend function")
                     return null
                 }
+                eventChecked = result
             } catch (e: Throwable) {
                 config?.logger?.log("Error in beforeSend function: $e")
                 return null
@@ -617,7 +622,11 @@ public open class PostHogStateless protected constructor(
         if (ignored.isNullOrEmpty()) {
             return false
         }
-        val match = findIgnoredTypeInCauseChain(throwable, ignored) ?: return false
+        // Start where the coercer starts: the PostHogThrowable transport wrapper is never
+        // serialized, so matching it (or letting it consume walk capacity) would make the
+        // suppression decision diverge from the visible chain.
+        val root = if (throwable is PostHogThrowable) throwable.cause else throwable
+        val match = root?.let { findIgnoredTypeInCauseChain(it, ignored) } ?: return false
         config?.logger?.log(
             "Skipping \$exception: ${match.name} (or a cause in its chain) matches ignoredExceptionTypes",
         )
@@ -628,13 +637,11 @@ public open class PostHogStateless protected constructor(
         throwable: Throwable,
         ignored: List<Class<out Throwable>>,
     ): Class<out Throwable>? {
-        // same cycle detection as ThrowableCoercer, so both walks cover the same chain
-        val seen = hashSetOf<Throwable>()
-        var current: Throwable? = throwable
-        while (current != null && seen.add(current)) {
-            val link = current
+        // the same bounded, identity-based walk the coercer serializes, so the suppression
+        // decision and the visible chain agree, and a pathological `cause` getter cannot hang
+        // the capture path before the coercer's own bound applies
+        for (link in ThrowableCoercer.walkCauseChain(throwable)) {
             ignored.firstOrNull { it.isInstance(link) }?.let { return it }
-            current = link.cause
         }
         return null
     }
@@ -644,11 +651,56 @@ public open class PostHogStateless protected constructor(
         distinctId: String?,
         properties: Map<String, Any>?,
     ) {
+        captureExceptionEvent(
+            throwable,
+            distinctId = distinctId,
+            groups = null,
+            timestamp = null,
+        ) { properties }
+    }
+
+    /**
+     * The single pre-capture route for `$exception` events built from a [Throwable].
+     *
+     * Subclasses that need event fields [captureExceptionStateless] cannot carry (groups, an
+     * explicit timestamp) must go through here rather than coercing the throwable and calling
+     * [captureStateless] themselves, so the `ignoredExceptionTypes` prefilter, the
+     * caller-properties-win merge order and the personless fallback stay in one place instead of
+     * being re-implemented (and drifting) per capture path.
+     *
+     * [properties] is a provider invoked only once the enabled/opt-out state and the
+     * `ignoredExceptionTypes` prefilter have all passed, so callers can build expensive enrichment
+     * (e.g. a feature-flag evaluation that hits `/flags`) inside it without paying for an event
+     * that is about to be dropped. Its result is merged AFTER the coerced exception properties, so
+     * callers can override reserved keys such as `$exception_level`.
+     *
+     * This route never adds `$set`/`$set_once` of its own: `$exception` events are ingested by a
+     * separate error-tracking pipeline with no ordering guarantee against the person pipeline, so
+     * person updates are dropped server-side. Person properties therefore have no parameter here —
+     * send them with a regular [captureStateless] call or `identify`. (A caller that writes the
+     * reserved keys straight into [properties] still gets them serialized, same as any other
+     * reserved key it chooses to override; they simply have no effect.)
+     */
+    @PostHogInternal
+    protected fun captureExceptionEvent(
+        throwable: Throwable,
+        distinctId: String?,
+        groups: Map<String, String>?,
+        timestamp: Date?,
+        properties: () -> Map<String, Any>?,
+    ) {
         if (!isEnabled()) {
             return
         }
 
         try {
+            // gate before the property provider runs: enrichment must not fire for an event that
+            // opt-out or the ignore list is about to drop
+            if (config?.optOut == true) {
+                config?.logger?.log("PostHog is in OptOut state.")
+                return
+            }
+
             if (isIgnoredThrowable(throwable)) {
                 return
             }
@@ -657,10 +709,11 @@ public open class PostHogStateless protected constructor(
                 throwableCoercer.fromThrowableToPostHogProperties(
                     throwable,
                     inAppIncludes = config?.errorTrackingConfig?.inAppIncludes ?: listOf(),
+                    inAppExcludes = config?.errorTrackingConfig?.inAppExcludes ?: listOf(),
                     releaseIdentifier = config?.releaseIdentifier,
                 )
 
-            properties?.let {
+            properties()?.let {
                 exceptionProperties.putAll(it)
             }
 
@@ -670,7 +723,13 @@ public open class PostHogStateless protected constructor(
                 id = UUID.randomUUID().toString()
             }
 
-            captureStateless(PostHogEventName.EXCEPTION.event, distinctId = id, properties = exceptionProperties)
+            captureStateless(
+                PostHogEventName.EXCEPTION.event,
+                distinctId = id,
+                properties = exceptionProperties,
+                groups = groups,
+                timestamp = timestamp,
+            )
         } catch (e: Throwable) {
             // we swallow all exceptions that the SDK has thrown by trying to convert
             // a captured exception to a PostHog exception event
