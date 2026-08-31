@@ -1,5 +1,36 @@
 ## Next
 
+## 3.61.0
+
+### Minor Changes
+
+- 0f6b31a: Re-publish `posthog-android` so it resolves `posthog` 6.34.0, which carries the survey intro screen appearance fields (`displayIntroScreen`, `introScreenHeader`, `introScreenDescription`, `introScreenDescriptionContentType`, `introScreenButtonText`). `posthog-android` exposes the core SDK via `api`, so custom survey delegates consuming `PostHogDisplaySurveyAppearance` through this artifact could not see the new fields while its published dependency stayed pinned to 6.33.7.
+
+## 3.60.8
+
+### Patch Changes
+
+- 58aa3e7: Fix surveys scoped to web via a CSS selector or URL display condition leaking onto native Android. Surveys with `conditions.url` and/or `conditions.selector` are now excluded from active matching surveys, since those conditions can only be evaluated in a browser DOM. This mirrors the exclusion already shipped in posthog-ios and posthog-react-native.
+
+## 3.60.7
+
+### Patch Changes
+
+- e0827f0: Fix session replay started with `sessionReplay = false` staying stopped for the rest of the process after an internal stop, such as the session being cleared while the app is backgrounded.
+
+## 3.60.6
+
+### Patch Changes
+
+- 31b805f: Prevent malformed survey JSON from throwing while logging deserialization errors.
+
+## 3.60.5
+
+### Patch Changes
+
+- 42dcb3d: Prevent date arithmetic from overflowing for large second offsets.
+- 130ecd1: Fix manually started session replay being stopped by a queued session-rotation callback when automatic replay is disabled with `sessionReplay = false`.
+
 ## 3.60.4
 
 ### Patch Changes
