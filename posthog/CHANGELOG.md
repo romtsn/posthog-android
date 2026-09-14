@@ -1,5 +1,23 @@
 ## Next
 
+## 6.36.0
+
+### Minor Changes
+
+- 7068a36: Retain bounded durable queue entries across retryable transport and HTTP failures, pause while offline, and acknowledge successful batches by unique queue-entry identity. `maxRetries` now controls push subscription registration retries, not durable queue flush attempts. Preserve existing queued records when a new record fails to persist, and enforce FIFO capacity when loading records from disk.
+
+## 6.35.0
+
+### Minor Changes
+
+- 5e3267b: Add `PostHogAndroid.capturePushNotificationOpened(intent)` to capture `$push_notification_opened` for a launch intent the SDK was installed too late to read. In the published test fixtures, `PostHogFake.optOut()` and `optIn()` now change what `isOptOut()` returns, where they were previously no-ops.
+
+## 6.34.2
+
+### Patch Changes
+
+- 0e6d7a4: Fix: a session recording started by an event trigger now checks the same gates as every other start path. A matching event used to start recording even when `PostHogConfig.sessionReplay` was false, the project flag was off, or sampling excluded the session, so an app that gates replay behind its own feature flag recorded the users the flag excluded. A manual start can still wait for a matching event, and `PostHog.stopSessionReplay` cancels that pending request.
+
 ## 6.34.1
 
 ### Patch Changes
