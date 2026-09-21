@@ -1,6 +1,7 @@
 package com.posthog.android.internal
 
 import android.content.Context
+import android.content.pm.PackageInfo
 import com.posthog.PostHogIntegration
 import com.posthog.PostHogInterface
 import com.posthog.android.PostHogAndroidConfig
@@ -9,13 +10,13 @@ import com.posthog.internal.PostHogPreferences.Companion.VERSION
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * Captures app installed and updated events
- * @property context the App Context
+ * Records app version/build and optionally captures app installed and updated events
  * @property config the Config
  */
 internal class PostHogAppInstallIntegration(
-    private val context: Context,
+    context: Context,
     private val config: PostHogAndroidConfig,
+    private val packageInfoProvider: () -> PackageInfo? = { getPackageInfo(context, config) },
 ) : PostHogIntegration {
     private var ownsInstallation = false
 
@@ -32,18 +33,23 @@ internal class PostHogAppInstallIntegration(
         if (config.cachePreferences?.isAvailable() == false) {
             return
         }
-        if (!integrationInstalled.compareAndSet(false, true)) {
-            return
-        }
-        ownsInstallation = true
-
-        getPackageInfo(context, config)?.let { packageInfo ->
+        packageInfoProvider()?.let { packageInfo ->
             config.cachePreferences?.let { preferences ->
                 val versionName = packageInfo.versionName
                 val versionCode = packageInfo.versionCodeCompat()
 
                 val previousVersion = preferences.getValue(VERSION) as? String
                 var previousBuild = preferences.getValue(BUILD)
+
+                // Remember this launch independently of event capture, using the previous values
+                // above to classify it. Consent still gates delivery in postHog.capture.
+                versionName?.let { preferences.setValue(VERSION, it) }
+                versionCode?.let { preferences.setValue(BUILD, it) }
+
+                if (!config.captureApplicationLifecycleEvents || !integrationInstalled.compareAndSet(false, true)) {
+                    return
+                }
+                ownsInstallation = true
 
                 val event: String
                 val props = mutableMapOf<String, Any>()
@@ -68,9 +74,6 @@ internal class PostHogAppInstallIntegration(
                 }
                 versionName?.let { props["version"] = it }
                 versionCode?.let { props["build"] = it }
-
-                versionName?.let { preferences.setValue(VERSION, it) }
-                versionCode?.let { preferences.setValue(BUILD, it) }
 
                 postHog.capture(event, properties = props)
             }

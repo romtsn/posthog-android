@@ -1,5 +1,81 @@
 ## Next
 
+## 3.68.0
+
+### Minor Changes
+
+- a4468e0: Add opt-in rage and dead tap detection for Android Views and Jetpack Compose, independent of session replay.
+- 05bf361: Add opt-in `captureElementInteractions` for actionable View and Compose taps, independent of session replay. Emits privacy-safe `$autocapture` events with browser-compatible element properties (types, resource IDs/test tags and hierarchy positions), the mobile `touch` event type and window-local touch coordinates in dp, never text or input values. Add keyed View and Compose subtree exclusions and respect explicit replay masking.
+
+### Patch Changes
+
+- 8aedddd: Remember each project's app version and build even when lifecycle events are disabled or suppressed, including version-name changes with an unchanged build, so later launches report the correct previous version without false Application Installed events.
+
+## 3.67.0
+
+### Minor Changes
+
+- d0a59ab: Support survey targeting by a specific linked feature flag variant.
+
+## 3.66.4
+
+### Patch Changes
+
+- 9c83392: Support skipSubmitButton for survey rating and single-choice questions. The Compose renderer submits eligible selections immediately and hides the submit button; multiple-choice questions and single-choice questions with an open option retain explicit submission.
+
+## 3.66.3
+
+### Patch Changes
+
+- 26b78ae: Fix automatic deep-link capture for warm `singleTop` and `singleTask` activity launches. Call `setIntent(intent)` in `onNewIntent` so the SDK can capture the new intent on resume. Repeated resumes do not duplicate the event, while distinct intents with the same URL are captured separately.
+
+## 3.66.2
+
+### Patch Changes
+
+- 1293056: Stop sending the unused `platform` field when registering a device for push notifications. The API resolves the provider from `app_id` alone and ignores `platform`, so the field was dead weight. It was also the only field in the request without `@SerializedName`, which meant R8 renamed it in minified release builds. Removing it drops that failure mode instead of working around it.
+
+## 3.66.1
+
+### Patch Changes
+
+- 57ae6ed: fix: stop retrying push registration when the project API key is not valid
+  
+  A device that gets `401 invalid_api_key` from the registration endpoint stops sending push
+  registrations for that key instead of re-posting on every app open. Adds the internal
+  `PostHogPreferences.PUSH_SUBSCRIPTION_REJECTED` key, which holds that verdict and survives `reset()`.
+
+## 3.66.0
+
+### Minor Changes
+
+- 853ec7d: Add the internal `persistOptOut` config so a wrapper SDK that owns consent can stop a persisted opt-out from overriding the value it passes to setup.
+
+## 3.65.2
+
+### Patch Changes
+
+- e1523b5: Send `$groupidentify` through `capture()` so it carries the session id, identity flags and shared properties like every other event, matching posthog-js
+
+## 3.65.1
+
+### Patch Changes
+
+- 6e57336: Cut the heap a session replay screenshot needs. The Base64 encoder buffer was sized from the bitmap's `allocationByteCount`, so every capture reserved a second full uncompressed frame, about 10 MB on a 1080x2400 screen, for a payload that lands in the tens of kilobytes. The buffer is now sized from a compressed estimate, and the compressed bytes stream straight into the encoder instead of being held in an intermediate array. Devices with a small heap were running out of memory on this allocation at the default 1 second capture cadence.
+
+## 3.65.0
+
+### Minor Changes
+
+- 61c1a0e: Change `capturePushNotificationOpened` to skip a PostHog-sent notification open already captured in the last 5 minutes (same `invocation_id` and `action_id`), unless the payload's `google.message_id` differs.
+
+## 3.64.1
+
+### Patch Changes
+
+- 20c72a2: Move replay buffer initialization and leftover-file cleanup off the SDK setup thread onto the replay executor to reduce main-thread startup stalls, including when session replay is disabled.
+- 1ae7aed: Resolve the cache directory and package information at most once per SDK setup, only when needed, and reuse the results across startup consumers.
+
 ## 3.64.0
 
 ### Minor Changes
