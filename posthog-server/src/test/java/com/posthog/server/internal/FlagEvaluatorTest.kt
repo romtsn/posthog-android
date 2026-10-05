@@ -4,6 +4,7 @@ import com.google.gson.reflect.TypeToken
 import com.posthog.PostHogConfig
 import com.posthog.internal.FlagDefinition
 import com.posthog.internal.FlagProperty
+import com.posthog.internal.PostHogDateProvider
 import com.posthog.internal.PropertyGroup
 import com.posthog.internal.PropertyOperator
 import com.posthog.internal.PropertyType
@@ -13,7 +14,10 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
+import java.time.Instant
 import java.time.ZonedDateTime
+import java.util.Date
+import java.util.TimeZone
 
 internal class FlagEvaluatorTest {
     private lateinit var config: PostHogConfig
@@ -812,6 +816,69 @@ internal class FlagEvaluatorTest {
     }
 
     @Test
+    internal fun testDateOnlyConditionIsInterpretedAsUtc() {
+        withDefaultTimeZone("America/New_York") {
+            val property =
+                FlagProperty("signup", "2024-06-01", PropertyOperator.IS_DATE_AFTER, PropertyType.PERSON, false, null)
+            assertTrue(evaluator.matchProperty(property, mapOf("signup" to "2024-06-01T02:00:00Z")))
+        }
+    }
+
+    @Test
+    internal fun testNaiveDateTimeConditionIsInterpretedAsUtc() {
+        withDefaultTimeZone("America/New_York") {
+            val property =
+                FlagProperty("signup", "2024-06-01 00:00:00", PropertyOperator.IS_DATE_AFTER, PropertyType.PERSON, false, null)
+            assertTrue(evaluator.matchProperty(property, mapOf("signup" to "2024-06-01T02:00:00Z")))
+        }
+    }
+
+    @Test
+    internal fun testNaiveDateTimePropertyIsInterpretedAsUtc() {
+        withDefaultTimeZone("America/New_York") {
+            val property =
+                FlagProperty("signup", "2024-06-01T03:00:00Z", PropertyOperator.IS_DATE_AFTER, PropertyType.PERSON, false, null)
+            assertFalse(evaluator.matchProperty(property, mapOf("signup" to "2024-06-01 02:00:00")))
+        }
+    }
+
+    @Test
+    internal fun testRelativeDateSubtractsFromCurrentUtcTime() {
+        withDefaultTimeZone("America/New_York") {
+            config.dateProvider = FixedDateProvider(Date.from(Instant.parse("2025-03-31T02:00:00Z")))
+            val property =
+                FlagProperty("last_seen", "-1m", PropertyOperator.IS_DATE_AFTER, PropertyType.PERSON, false, null)
+            // In UTC, one month before 2025-03-31T02:00Z is 2025-02-28T02:00Z.
+            assertTrue(evaluator.matchProperty(property, mapOf("last_seen" to "2025-02-28T12:00:00Z")))
+        }
+    }
+
+    private fun withDefaultTimeZone(
+        zoneId: String,
+        block: () -> Unit,
+    ) {
+        synchronized(TimeZone::class.java) {
+            val originalTimeZone = TimeZone.getDefault()
+            try {
+                TimeZone.setDefault(TimeZone.getTimeZone(zoneId))
+                block()
+            } finally {
+                TimeZone.setDefault(originalTimeZone)
+            }
+        }
+    }
+
+    private class FixedDateProvider(private val date: Date) : PostHogDateProvider {
+        override fun currentDate(): Date = date
+
+        override fun addSecondsToCurrentDate(seconds: Int): Date = Date(date.time + seconds * 1000L)
+
+        override fun currentTimeMillis(): Long = date.time
+
+        override fun nanoTime(): Long = date.time * 1_000_000L
+    }
+
+    @Test
     internal fun testGetMatchingVariant() {
         val flag = createMultiVariateFlag()
         val variant1 = evaluator.getMatchingVariant(flag, "user-with-control")
@@ -1041,7 +1108,7 @@ internal class FlagEvaluatorTest {
     @Test
     internal fun testMixedConditionsFlag() {
         val flag = createMixedConditionsFlag()
-        val withoutSpaces = mapOf("email" to "example@example.com")
+        val withoutSpaces = matchingMixedProperties()
         val resultWithoutSpaces =
             evaluator.matchFeatureFlagProperties(flag, "user-123", withoutSpaces)
         assertEquals(true, resultWithoutSpaces)
@@ -1051,8 +1118,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagExactMismatch() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email does not match exact condition
-        val properties = mapOf("email" to "other@example.com")
+        val properties = matchingMixedProperties().apply { put("exact", "other@example.com") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1061,8 +1127,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagIsNotViolation() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email matches is_not exclusion list
-        val properties = mapOf("email" to "not_example@example.com")
+        val properties = matchingMixedProperties().apply { put("is_not", "not_example@example.com") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1071,8 +1136,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagIcontainsMismatch() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email does not contain "example"
-        val properties = mapOf("email" to "test@test.com")
+        val properties = matchingMixedProperties().apply { put("icontains", "test@test.com") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1081,8 +1145,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagNotIcontainsViolation() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email contains ".net"
-        val properties = mapOf("email" to "example@example.net")
+        val properties = matchingMixedProperties().apply { put("not_icontains", "example@example.net") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1091,8 +1154,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagRegexMismatch() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email does not match regex pattern (invalid format)
-        val properties = mapOf("email" to "invalid-email-format")
+        val properties = matchingMixedProperties().apply { put("regex", "invalid-email-format") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1101,8 +1163,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagNotRegexViolation() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email matches not_regex exclusion pattern
-        val properties = mapOf("email" to "example@example.com@yahoo.com")
+        val properties = matchingMixedProperties().apply { put("not_regex", "example@example.com@yahoo.com") }
         val result = evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
         assertEquals(false, result)
     }
@@ -1111,8 +1172,7 @@ internal class FlagEvaluatorTest {
     internal fun testAllConditionsFlagIsSetViolation() {
         val flag = createMixedConditionsFlag()
 
-        // Negative case: email is not set
-        val properties = mapOf("name" to "Test User")
+        val properties = matchingMixedProperties().apply { remove("is_set") }
         try {
             evaluator.matchFeatureFlagProperties(flag, "user-123", properties)
             assertTrue("Should have thrown InconclusiveMatchException", false)
@@ -1229,6 +1289,10 @@ internal class FlagEvaluatorTest {
         assertEquals(true, result)
     }
 
+    private fun matchingMixedProperties(): MutableMap<String, Any?> =
+        listOf("exact", "is_not", "icontains", "not_icontains", "regex", "not_regex", "is_set")
+            .associateWith<String, Any?> { "example@example.com" }.toMutableMap()
+
     internal fun createMixedConditionsFlag(): FlagDefinition {
         val json =
             """
@@ -1299,7 +1363,15 @@ internal class FlagEvaluatorTest {
             }
             """.trimIndent()
 
-        return config.serializer.gson.fromJson(json, FlagDefinition::class.java)
+        // Give each ANDed criterion its own input so a negative case can fail only its target.
+        val document = com.google.gson.JsonParser.parseString(json).asJsonObject
+        val properties =
+            document.getAsJsonObject("filters").getAsJsonArray("groups")[0]
+                .asJsonObject.getAsJsonArray("properties")
+        properties.forEach { property ->
+            property.asJsonObject.addProperty("key", property.asJsonObject["operator"].asString)
+        }
+        return config.serializer.gson.fromJson(document, FlagDefinition::class.java)
     }
 
     internal fun createCohortMemberFlag(): FlagDefinition {

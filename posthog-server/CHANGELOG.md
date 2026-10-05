@@ -1,5 +1,23 @@
 ## Next
 
+## 2.20.1
+
+### Patch Changes
+
+- 84ef634: fix(flags): interpret date-only and naive date conditions, and relative date lookbacks, in UTC during local evaluation instead of the JVM default timezone
+
+## 2.20.0
+
+### Minor Changes
+
+- 7d65bb3: feat(server): allow overriding the `$identify` event timestamp with `identify(distinctId, userProperties, userPropertiesSetOnce, timestamp)`
+
+## 2.19.0
+
+### Minor Changes
+
+- 39c2485: Add `only(PostHogFeatureFlagFilter)` to the `evaluateFlags()` snapshot in `posthog-server`. The filter combines flag keys and evaluation runtimes (`"all"`, `"client"` or `"server"`, as reported by `/local_evaluation`), so `snapshot.only(PostHogFeatureFlagFilter(evaluationRuntimes = setOf("client", "all")))` is the set of flags to forward to a browser. A flag that falls back to `/flags` keeps the runtime of its local definition. A flag with an unknown runtime (no local definition, or a definition that does not report the field) never matches a runtime criterion, because `/flags` does not report the runtime. Note that `/flags` treats this SDK as a server runtime and leaves `"client"` flags out of its response, so a `"client"` flag that does not resolve locally, for example because a person property is missing, is absent from the snapshot.
+
 ## 2.18.1
 
 ### Patch Changes

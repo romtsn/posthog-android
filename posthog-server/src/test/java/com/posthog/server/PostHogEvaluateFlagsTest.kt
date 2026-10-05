@@ -26,7 +26,10 @@ internal class PostHogEvaluateFlagsTest {
     @Test
     fun `evaluateFlags returns a snapshot and makes exactly one flags request`() {
         val mockServer = MockWebServer()
-        mockServer.enqueue(jsonResponse(createMultipleFlagsResponse("a" to true, "b" to false)))
+        mockServer.dispatcher =
+            CountingDispatcher({ MockResponse().setResponseCode(404) }, {
+                jsonResponse(createMultipleFlagsResponse("a" to true, "b" to false))
+            })
         mockServer.start()
 
         val postHog =
@@ -112,16 +115,15 @@ internal class PostHogEvaluateFlagsTest {
             )
 
         val snapshot = postHog.evaluateFlags("user-1")
+        mockServer.enqueue(MockResponse().setResponseCode(200))
         snapshot.isEnabled("a")
         snapshot.isEnabled("a")
         postHog.flush()
 
-        val requests = drainRequests(mockServer)
-        val batch = requests.first { it.path?.contains("/batch") == true }.parseBatch()
-        val flagCalledEvents = batch.batch.filter { it.get("event").asString == "\$feature_flag_called" }
-        assertEquals(1, flagCalledEvents.size, "second access must dedup")
+        val flagCalledEvents = drainRequests(mockServer).featureFlagCalledEvents()
+        assertEquals(1, flagCalledEvents.size, "second access must dedup across all batches")
 
-        val props = batch.eventProperties("\$feature_flag_called")
+        val props = flagCalledEvents.single().second
         assertEquals("a", props["\$feature_flag"])
         assertEquals(true, props["\$feature_flag_response"])
         assertEquals(11.0, props["\$feature_flag_id"]) // gson deserializes ints as doubles
@@ -312,6 +314,7 @@ internal class PostHogEvaluateFlagsTest {
         for ((caseName, evaluateFlags) in cases) {
             val mockServer = MockWebServer()
             mockServer.enqueue(jsonResponse(createFlagsResponse("a", enabled = true)))
+            mockServer.enqueue(MockResponse().setResponseCode(200))
             mockServer.start()
 
             var postHog: PostHogInterface? = null
@@ -348,6 +351,7 @@ internal class PostHogEvaluateFlagsTest {
     @Test
     fun `evaluateFlags with blank distinctId returns an empty snapshot and fires no events on access`() {
         val mockServer = MockWebServer()
+        mockServer.dispatcher = CountingDispatcher({ MockResponse().setResponseCode(404) }, { MockResponse().setResponseCode(400) })
         mockServer.start()
 
         val postHog =
@@ -364,15 +368,16 @@ internal class PostHogEvaluateFlagsTest {
 
         snapshot.isEnabled("anything")
         postHog.capture("u", "page_view")
+        postHog.flush()
 
         val requests = drainRequests(mockServer)
         val flagsRequests = requests.filter { it.path?.contains("/flags") == true }
         assertEquals(0, flagsRequests.size, "blank distinctId must short-circuit /flags")
-        val batch = requests.firstOrNull { it.path?.contains("/batch") == true }?.parseBatch()
-        if (batch != null) {
-            val events = batch.batch.map { it.get("event").asString }
-            assertFalse(events.contains("\$feature_flag_called"))
-        }
+        val events =
+            requests.filter { it.path?.contains("/batch") == true }
+                .flatMap { it.parseBatch().batch }
+                .map { it.get("event").asString }
+        assertEquals(listOf("page_view"), events)
 
         postHog.close()
         mockServer.shutdown()
@@ -572,6 +577,78 @@ internal class PostHogEvaluateFlagsTest {
             assertFalse(gated.containsKey("locally_evaluated"), "a remote-filled key is not locally evaluated")
         }
     }
+
+    @Test
+    fun `only filter keeps the runtime of the local definition for every flag it covers`() {
+        withLocalEvaluation(
+            definitions =
+                createLocalEvaluationResponseFrom(
+                    conclusiveFlagDefinition("client-flag", evaluationRuntime = "client"),
+                    conclusiveFlagDefinition("server-flag", evaluationRuntime = "server"),
+                    conclusiveFlagDefinition("unreported-flag"),
+                    emailGatedFlagDefinition("gated-flag", evaluationRuntime = "all"),
+                ),
+            flagsResponse = {
+                jsonResponse(createMultipleFlagsResponse("gated-flag" to true, "undefined-flag" to true))
+            },
+        ) { postHog, _, _ ->
+            val snapshot = postHog.evaluateFlags("user-1")
+            assertTrue(snapshot.isEnabled("gated-flag"), "the gated flag is filled from /flags")
+
+            // The filter a server uses to pick the flags it forwards to a browser. A flag filled
+            // from /flags keeps the runtime of its local definition.
+            assertEquals(setOf("client-flag", "gated-flag"), snapshot.runtimes("client", "all"))
+            assertEquals(setOf("server-flag"), snapshot.runtimes("server"))
+            assertEquals(
+                setOf("client-flag", "server-flag", "gated-flag"),
+                snapshot.runtimes("client", "server", "all"),
+                "a definition without the field, and a flag without a definition, never match a runtime",
+            )
+
+            // A local-only read never goes through the `/flags` merge, so the runtime must come
+            // from the flag built at evaluation time.
+            val localOnly = postHog.evaluateFlags("user-1", onlyEvaluateLocally = true)
+            assertEquals(setOf("client-flag"), localOnly.runtimes("client", "all"))
+            assertEquals(setOf("server-flag"), localOnly.runtimes("server"))
+        }
+    }
+
+    @Test
+    fun `an evaluation runtime reported by flags is ignored`() {
+        withLocalEvaluation(
+            definitions =
+                createLocalEvaluationResponseFrom(
+                    emailGatedFlagDefinition("gated-server-flag", evaluationRuntime = "server"),
+                    emailGatedFlagDefinition("gated-unreported-flag"),
+                ),
+            // `/flags` does not report the field. If it ever does, or a response is tampered with,
+            // the local definition stays the only source, so a response cannot reclassify a
+            // server-only flag as client-safe.
+            flagsResponse = {
+                jsonResponse(
+                    createMultipleFlagsResponse(
+                        "gated-server-flag" to true,
+                        "gated-unreported-flag" to true,
+                        "undefined-flag" to true,
+                        evaluationRuntime = "client",
+                    ),
+                )
+            },
+        ) { postHog, _, _ ->
+            val snapshot = postHog.evaluateFlags("user-1")
+
+            assertTrue(snapshot.runtimes("client", "all").isEmpty())
+            assertEquals(setOf("gated-server-flag"), snapshot.runtimes("server"))
+            assertEquals(
+                setOf("gated-server-flag"),
+                snapshot.runtimes("client", "server", "all"),
+                "a definition without the field, and the response's runtime, stay unknown",
+            )
+        }
+    }
+
+    private fun PostHogFeatureFlagEvaluations.runtimes(vararg runtimes: String): Set<String> =
+        only(PostHogFeatureFlagFilter(evaluationRuntimes = runtimes.toSet())).keys.toSet()
 
     @Test
     fun `an error thrown while evaluating one flag falls back for that flag instead of crashing`() {

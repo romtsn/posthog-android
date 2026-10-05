@@ -1,5 +1,29 @@
 ## Next
 
+## 6.46.0
+
+### Minor Changes
+
+- 7d65bb3: feat(server): allow overriding the `$identify` event timestamp with `identify(distinctId, userProperties, userPropertiesSetOnce, timestamp)`
+
+## 6.45.2
+
+### Patch Changes
+
+- 572b972: Stop session replay when the remote config reports the mobile recordings quota as exceeded (`quotaLimited` contains `mobile_recordings`). Replay resumes once a later remote config no longer reports it.
+
+## 6.45.1
+
+### Patch Changes
+
+- 32d2898: Stop event properties from overriding `$process_person_profile` and `$is_identified`, so a caller-supplied `true` can no longer create person profiles when `personProfiles` is `NEVER` or the user is anonymous under `IDENTIFIED_ONLY`, matching posthog-ios and posthog-js. Per-event values for these two properties are now ignored; use `beforeSend` if you need to rewrite them
+
+## 6.45.0
+
+### Minor Changes
+
+- 39c2485: Add `only(PostHogFeatureFlagFilter)` to the `evaluateFlags()` snapshot in `posthog-server`. The filter combines flag keys and evaluation runtimes (`"all"`, `"client"` or `"server"`, as reported by `/local_evaluation`), so `snapshot.only(PostHogFeatureFlagFilter(evaluationRuntimes = setOf("client", "all")))` is the set of flags to forward to a browser. A flag that falls back to `/flags` keeps the runtime of its local definition. A flag with an unknown runtime (no local definition, or a definition that does not report the field) never matches a runtime criterion, because `/flags` does not report the runtime. Note that `/flags` treats this SDK as a server runtime and leaves `"client"` flags out of its response, so a `"client"` flag that does not resolve locally, for example because a person property is missing, is absent from the snapshot.
+
 ## 6.44.0
 
 ### Minor Changes

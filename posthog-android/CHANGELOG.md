@@ -1,5 +1,23 @@
 ## Next
 
+## 3.71.4
+
+### Patch Changes
+
+- 3d0717c: Fix session replay staying active after an explicit stop when it raced an automatic restart with `sessionReplay = false`
+
+## 3.71.3
+
+### Patch Changes
+
+- 572b972: Stop session replay when the remote config reports the mobile recordings quota as exceeded (`quotaLimited` contains `mobile_recordings`). Replay resumes once a later remote config no longer reports it.
+
+## 3.71.2
+
+### Patch Changes
+
+- 32d2898: Stop event properties from overriding `$process_person_profile` and `$is_identified`, so a caller-supplied `true` can no longer create person profiles when `personProfiles` is `NEVER` or the user is anonymous under `IDENTIFIED_ONLY`, matching posthog-ios and posthog-js. Per-event values for these two properties are now ignored; use `beforeSend` if you need to rewrite them
+
 ## 3.71.1
 
 ### Patch Changes
