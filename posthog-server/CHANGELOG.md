@@ -1,5 +1,23 @@
 ## Next
 
+## 2.21.1
+
+### Patch Changes
+
+- fb21f39: Retry feature flag requests that fail with a DNS or TLS transport error, instead of only timeouts, EOF, and connection resets
+
+## 2.21.0
+
+### Minor Changes
+
+- 8c11301: Add `projectToken` to `PostHogConfig` and `PostHogAndroidConfig` and deprecate `apiKey` (Kotlin subclasses calling `super(apiKey = ...)` must switch to `projectToken =`)
+
+## 2.20.2
+
+### Patch Changes
+
+- 4c562de: Require Okio 3.11.0 or later to prevent corrupt gzip request bodies when Android's JNI layer copies compression buffers. This includes the upstream DeflaterSink fix and retains the Kotlin 2.0 compatibility target. Applications overriding transitive dependencies should allow the updated Okio version.
+
 ## 2.20.1
 
 ### Patch Changes
