@@ -1,5 +1,29 @@
 ## Next
 
+## 6.48.0
+
+### Minor Changes
+
+- 3366547: Support Firebase Installation ID (FID) push registration. When the app enables `firebase_messaging_installation_id_enabled`, the SDK registers the FID instead of calling the deprecated `getToken()`. Forward `onRegistered` to `registerPushNotificationToken(installationId, appId)` to refresh the subscription even when the FID is unchanged. Automatic startup registration still skips previously delivered subscriptions, and pending registrations retain their retry backoff.
+
+## 6.47.8
+
+### Patch Changes
+
+- 0310daf: Fix session replay recording into the opted-out session when a linked feature flag or pending remote config delayed its restart after `optIn()`.
+
+## 6.47.7
+
+### Patch Changes
+
+- 6a80525: Avoid unnecessary Calendar allocations when reading device-clock timestamps.
+
+## 6.47.6
+
+### Patch Changes
+
+- cb6fe68: Fix `beforeSend` running twice for each captured event, which discarded the hook's changes to `distinctId`, `timestamp` and `uuid` and compounded random sampling
+
 ## 6.47.5
 
 ### Patch Changes

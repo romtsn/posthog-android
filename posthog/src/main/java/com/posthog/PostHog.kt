@@ -26,6 +26,7 @@ import com.posthog.internal.PostHogPreferences.Companion.SURVEYS
 import com.posthog.internal.PostHogPreferences.Companion.VERSION
 import com.posthog.internal.PostHogPrintLogger
 import com.posthog.internal.PostHogPushSubscriptionManager
+import com.posthog.internal.PostHogPushSubscriptionReceiver
 import com.posthog.internal.PostHogQueue
 import com.posthog.internal.PostHogQueueInterface
 import com.posthog.internal.PostHogRemoteConfig
@@ -107,7 +108,7 @@ public class PostHog private constructor(
             PostHogThreadFactory("PostHogPushSubscriptionThread"),
         ),
     private val reloadFeatureFlags: Boolean = true,
-) : PostHogInterface, PostHogStateless() {
+) : PostHogInterface, PostHogStateless(), PostHogPushSubscriptionReceiver {
     private val anonymousLock = Any()
     private val deviceIdLock = Any()
     private val identifiedLock = Any()
@@ -458,7 +459,8 @@ public class PostHog private constructor(
                     sessionReplayHandler = it
 
                     if (startSessionReplay) {
-                        startSessionReplayInternal(resumeCurrent = resumeSessionReplay)
+                        // setup() resumes the current session and optIn() has already started a new one
+                        startSessionReplayInternal(resumeCurrent = resumeSessionReplay, rotateSession = false)
                     }
                 } else if (it is PostHogSurveysHandler) {
                     surveysHandler = it
@@ -1037,7 +1039,9 @@ public class PostHog private constructor(
                     },
                 )
 
-            val postHogEvent = buildEvent(event, newDistinctId, mergedProperties, timestamp)
+            val eventProperties = minimizeIfFeatureFlagCalled(event, mergedProperties)
+
+            val postHogEvent = buildEvent(event, newDistinctId, eventProperties, timestamp)
             if (postHogEvent == null) {
                 val originalMessage = "PostHog event $event was dropped"
                 val message =
@@ -1060,18 +1064,15 @@ public class PostHog private constructor(
             if (isSnapshotEvent) {
                 replayQueue?.add(postHogEvent)
             } else {
-                val queued =
-                    captureStatelessInternal(
-                        postHogEvent.event,
-                        newDistinctId,
-                        postHogEvent.properties ?: emptyMap(),
-                        userProperties,
-                        userPropertiesSetOnce,
-                        groups,
-                        timestamp,
-                    )
-                if (queued && claimedReplayDebugBundle) {
-                    commitReplayDebugPropertiesWindow()
+                val queue = queue
+                // beforeSend may have opted out
+                if (isOptedOut()) {
+                    config?.logger?.log("PostHog is in OptOut state.")
+                } else if (queue != null) {
+                    queue.add(postHogEvent)
+                    if (claimedReplayDebugBundle) {
+                        commitReplayDebugPropertiesWindow()
+                    }
                 }
                 // Notify surveys integration about the event
                 surveysHandler?.onEvent(event, mergedProperties)
@@ -1365,6 +1366,12 @@ public class PostHog private constructor(
             }
 
             if (wasOptedOut) {
+                // rotate even if the linked flag or remote config then holds replay off, so a later start
+                // doesn't resume the session that was active while opted out
+                if (sessionReplayWanted) {
+                    PostHogSessionManager.endSession()
+                    PostHogSessionManager.startSession()
+                }
                 installIntegrations(resumeSessionReplay = false, startSessionReplay = sessionReplayWanted, surveys = surveys)
                 // install re-arms each integration from local config; re-apply the cached remote
                 // config (e.g. exception autocapture turned off remotely) instead of waiting for a reload
@@ -2357,6 +2364,22 @@ public class PostHog private constructor(
         deviceToken: String,
         appId: String,
     ) {
+        registerPushNotificationToken(deviceToken, appId, refresh = true)
+    }
+
+    @PostHogInternal
+    override fun registerPushNotificationTokenIfNeeded(
+        deviceToken: String,
+        appId: String,
+    ) {
+        registerPushNotificationToken(deviceToken, appId, refresh = false)
+    }
+
+    private fun registerPushNotificationToken(
+        deviceToken: String,
+        appId: String,
+        refresh: Boolean,
+    ) {
         if (!isEnabled()) {
             return
         }
@@ -2376,6 +2399,7 @@ public class PostHog private constructor(
         pushSubscriptionManager?.register(
             deviceToken = deviceToken,
             appId = appId,
+            refresh = refresh,
         )
     }
 
@@ -2528,7 +2552,10 @@ public class PostHog private constructor(
         }
     }
 
-    private fun startSessionReplayInternal(resumeCurrent: Boolean) {
+    private fun startSessionReplayInternal(
+        resumeCurrent: Boolean,
+        rotateSession: Boolean = !resumeCurrent,
+    ) {
         if (!isEnabled()) {
             return
         }
@@ -2553,8 +2580,10 @@ public class PostHog private constructor(
 
                 it.start(true)
             } else {
-                endSession()
-                startSession()
+                if (rotateSession) {
+                    endSession()
+                    startSession()
+                }
 
                 if (!shouldRecordSession()) {
                     return
