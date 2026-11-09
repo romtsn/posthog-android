@@ -1,5 +1,35 @@
 ## Next
 
+## 3.76.1
+
+### Patch Changes
+
+- 85142d6: Fix Compose modal scrims masking the whole window as an image, which recorded a `ModalBottomSheet` as a solid black frame
+
+## 3.76.0
+
+### Minor Changes
+
+- e9a8f5d: Compose activity and dialog windows into one scene in screenshot-mode session replay.
+
+## 3.75.3
+
+### Patch Changes
+
+- b17ca78: Stop recording session replay touches that land inside a `ph-no-capture` view or a `postHogMask()` Compose node
+
+## 3.75.2
+
+### Patch Changes
+
+- 784571b: Survey eligibility checks no longer send `$feature_flag_called` events for keys starting with `survey-targeting-`, matching posthog-js. Other flag keys retain their configured tracking behavior, and linked-variant lookups remain silent.
+
+## 3.75.1
+
+### Patch Changes
+
+- f459156: Session replay now masks Jetpack Compose images that have no content description, such as `Image` or Coil `AsyncImage` with `contentDescription = null`, when `maskAllImages` is enabled.
+
 ## 3.75.0
 
 ### Minor Changes

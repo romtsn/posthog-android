@@ -69,7 +69,9 @@ public class PostHogSessionReplayConfig
          * Capture touch coordinates in session replay. Defaults to true.
          * Set before SDK setup. Runtime changes are not supported.
          * Screenshot and view capture are unaffected.
-         * Disable this when touch positions could reveal sensitive input, even if the views are masked.
+         * Touches inside views marked `ph-no-capture` or `postHogMask()` nodes are never recorded.
+         * Disable this when other touch positions could reveal sensitive input, such as taps on
+         * fields masked only by `maskAllTextInputs`.
          */
         public var captureTouches: Boolean = true
 
@@ -116,8 +118,9 @@ public class PostHogSessionReplayConfig
          * Pixel format used for screenshot captures. Defaults to [PostHogScreenshotColorMode.ARGB_8888]
          * to preserve alpha and color precision before lossy WebP compression.
          * [PostHogScreenshotColorMode.RGB_565] uses less bitmap memory but reduces color precision
-         * and removes alpha, making transparent window regions appear black. Devices that reject
-         * RGB_565 fall back to ARGB_8888. Does not enable screenshot capture.
+         * and removes alpha, making transparent activity window regions appear black. In composed
+         * scenes, dialogs use ARGB_8888 to preserve transparency. Devices that reject RGB_565 fall
+         * back to ARGB_8888. Does not enable screenshot capture.
          */
         @PostHogExperimental
         @Volatile
