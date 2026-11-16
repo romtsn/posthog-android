@@ -1,5 +1,30 @@
 ## Next
 
+## 6.49.1
+
+### Patch Changes
+
+- b3afe48: Treat failed detailed feature flag records as unavailable values and payloads, independently of response-wide errors. Preserve successful cached values on errored client refreshes and same-context local decisions during server fallback. Report failed direct reads as evaluation failures without tracking caller defaults as evaluated responses.
+
+## 6.49.0
+
+### Minor Changes
+
+- cad8645: Add disableGeoIp configuration to skip GeoIP enrichment for analytics events and feature flag requests.
+
+## 6.48.2
+
+### Patch Changes
+
+- 6540a3f: Store the person-properties dedup hash only after the `$set` or `$identify` event is queued, and only when the event as sent still processes the person. An update that `beforeSend` dropped or made personless, or one made while opted out, is no longer skipped when it is repeated.
+
+## 6.48.1
+
+### Patch Changes
+
+- 0df75de: Ignore a remote config reply from a closed setup once the client is set up again, so it cannot re-arm the old integrations.
+- afda8ef: Stop a remote config reply that arrives after `close()` from reinstalling integrations on the closed client.
+
 ## 6.48.0
 
 ### Minor Changes

@@ -32,8 +32,10 @@ import com.posthog.internal.errortracking.PostHogThrowable
 import com.posthog.internal.surveys.PostHogSurveysHandler
 import com.posthog.surveys.Survey
 import com.posthog.vendor.uuid.TimeBasedEpochGenerator
+import okhttp3.mockwebserver.Dispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.MockWebServer
+import okhttp3.mockwebserver.RecordedRequest
 import org.junit.Rule
 import org.junit.rules.TemporaryFolder
 import java.io.File
@@ -106,6 +108,7 @@ internal class PostHogTest {
         exceptionStepsEnabled: Boolean = true,
         exceptionStepsMaxBytes: Int = 32768,
         sessionReplay: Boolean = false,
+        disableGeoIp: Boolean = false,
     ): PostHogInterface {
         config =
             PostHogConfig(PROJECT_TOKEN, host).apply {
@@ -135,6 +138,7 @@ internal class PostHogTest {
                 this.context = context
                 this.personProfiles = personProfiles
                 this.sessionReplay = sessionReplay
+                this.disableGeoIp = disableGeoIp
             }
         return PostHog.withInternal(
             config,
@@ -154,6 +158,135 @@ internal class PostHogTest {
         }
         pushOpenHttp?.shutdown()
         tmpDir.root.deleteRecursively()
+    }
+
+    @Test
+    fun `GeoIP is enabled by default and caller markers are preserved`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), flushAt = 20, preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.capture(EVENT)
+        sut.capture(EVENT, properties = mapOf("\$geoip_disable" to true))
+        sut.flush()
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val batch = serializer.deserialize<PostHogBatchEvent>(http.takeRequest().body.unGzip().reader())
+        assertEquals(2, batch.batch.size)
+        assertFalse(batch.batch[0].properties!!.containsKey("\$geoip_disable"))
+        assertEquals(true, batch.batch[1].properties!!["\$geoip_disable"])
+    }
+
+    @Test
+    fun `disableGeoIp marks all analytics events without changing person or group properties`() {
+        val http = mockHttp()
+        val sut =
+            getSut(
+                http.url("/").toString(),
+                flushAt = 20,
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                disableGeoIp = true,
+            )
+
+        sut.capture(EVENT, properties = mapOf("\$geoip_disable" to false))
+        sut.identify("identified-user", userProperties = userProps, userPropertiesSetOnce = userPropsOnce)
+        sut.alias("alias-user")
+        sut.group("organization", "acme", groupProperties = mapOf("plan" to "paid"))
+        sut.screen("Home")
+        sut.flush()
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val batch = serializer.deserialize<PostHogBatchEvent>(http.takeRequest().body.unGzip().reader())
+        assertEquals(setOf(EVENT, "\$identify", "\$create_alias", "\$groupidentify", "\$screen"), batch.batch.map { it.event }.toSet())
+        batch.batch.forEach { event ->
+            assertEquals(true, event.properties!!["\$geoip_disable"], event.event)
+            listOf("\$set", "\$set_once", "\$group_set").forEach { key ->
+                val nested = event.properties!![key] as? Map<*, *>
+                assertFalse(nested?.containsKey("\$geoip_disable") == true)
+            }
+        }
+        val identify = batch.batch.single { it.event == "\$identify" }
+        assertEquals(userProps, identify.properties!!["\$set"])
+        assertEquals(userPropsOnce, identify.properties!!["\$set_once"])
+        val group = batch.batch.single { it.event == "\$groupidentify" }
+        assertEquals(mapOf("plan" to "paid"), group.properties!!["\$group_set"])
+    }
+
+    @Test
+    fun `beforeSend can inspect and override the GeoIP marker`() {
+        val http = mockHttp()
+        var observedMarker: Any? = null
+        val sut =
+            getSut(
+                http.url("/").toString(),
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                disableGeoIp = true,
+                beforeSend = { event ->
+                    observedMarker = event.properties?.get("\$geoip_disable")
+                    event.properties?.put("\$geoip_disable", false)
+                    event
+                },
+            )
+
+        sut.capture(EVENT)
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val batch = serializer.deserialize<PostHogBatchEvent>(http.takeRequest().body.unGzip().reader())
+        assertEquals(true, observedMarker)
+        assertEquals(false, batch.batch.single().properties!!["\$geoip_disable"])
+    }
+
+    @Test
+    fun `disableGeoIp does not add a marker to replay snapshots`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, disableGeoIp = true)
+
+        sut.capture("\$snapshot", properties = props)
+        replayQueueExecutor.shutdownAndAwaitTermination()
+
+        val events = serializer.deserialize<List<PostHogEvent>>(http.takeRequest().body.unGzip().reader())
+        assertEquals("\$snapshot", events.single().event)
+        assertFalse(events.single().properties!!.containsKey("\$geoip_disable"))
+    }
+
+    @Test
+    fun `flags requests respect disableGeoIp`() {
+        for (disabled in listOf(false, true)) {
+            val http = mockHttp(response = MockResponse().setBody(responseFlagsApi))
+            val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, disableGeoIp = disabled)
+            val loaded = CountDownLatch(1)
+
+            sut.reloadFeatureFlags { loaded.countDown() }
+            assertTrue(loaded.await(10, TimeUnit.SECONDS))
+
+            val request = http.takeRequest()
+            assertEquals("/flags/?v=2", request.path)
+            val body = serializer.deserialize<Map<String, Any>>(request.body.unGzip().reader())
+            assertEquals(disabled, body["geoip_disable"])
+            sut.close()
+        }
+    }
+
+    @Test
+    fun `minimal feature flag called events retain the GeoIP marker`() {
+        val response = File("src/test/resources/json/basic-flags-minimal-flag-called-events.json").readText()
+        val http = mockHttp(response = MockResponse().setBody(response))
+        http.enqueue(MockResponse())
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, disableGeoIp = true)
+
+        sut.reloadFeatureFlags()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+        http.takeRequest()
+
+        assertFalse(sut.getFeatureFlag("IAmInactive") as Boolean)
+        queueExecutor.shutdownAndAwaitTermination()
+
+        val batch = serializer.deserialize<PostHogBatchEvent>(http.takeRequest().body.unGzip().reader())
+        val event = batch.batch.single()
+        assertEquals("\$feature_flag_called", event.event)
+        assertEquals(true, event.properties!!["\$geoip_disable"])
+        assertFalse(event.properties!!.containsKey("\$active_feature_flags"))
     }
 
     @Test
@@ -333,6 +466,110 @@ internal class PostHogTest {
 
         val sut = getSut(url.toString(), integration = integration)
 
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(1, integration.remoteConfigCount)
+        assertEquals(0, integration.remoteConfigFailedCount)
+
+        sut.close()
+    }
+
+    private fun heldFlagsResponse(release: CountDownLatch): MockWebServer {
+        val http = httpServers.create()
+        http.dispatcher =
+            object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    release.await()
+                    return MockResponse().setBody(responseFlagsApi)
+                }
+            }
+        http.start()
+        return http
+    }
+
+    @Test
+    fun `remote config reply that arrives after close does not reach integrations`() {
+        val integration = FakePostHogIntegration()
+        val release = CountDownLatch(1)
+        val http = heldFlagsResponse(release)
+
+        val sut = getSut(http.url("/").toString(), integration = integration)
+        // the loader is now blocked on the held response
+        http.takeRequest()
+
+        sut.close()
+        release.countDown()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(0, integration.remoteConfigCount)
+        assertEquals(0, integration.remoteConfigFailedCount)
+    }
+
+    @Test
+    fun `remote config reply from a closed setup does not reach integrations after re-setup`() {
+        val integrationA = FakePostHogIntegration()
+        val integrationB = FakePostHogIntegration()
+        val release = CountDownLatch(1)
+        val http = heldFlagsResponse(release)
+
+        val sut = getSut(http.url("/").toString(), integration = integrationA)
+        // the loader of the first setup is now blocked on the held response
+        http.takeRequest()
+
+        sut.close()
+        val configB =
+            PostHogConfig(PROJECT_TOKEN, http.url("/").toString()).apply {
+                storagePrefix = tmpDir.newFolder().absolutePath
+                preloadFeatureFlags = false
+                cachePreferences = PostHogMemoryPreferences()
+                addIntegration(integrationB)
+            }
+        sut.setup(configB)
+
+        release.countDown()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(0, integrationA.remoteConfigCount)
+        assertEquals(0, integrationA.remoteConfigFailedCount)
+        // the second setup's own reply, and nothing from the first
+        assertEquals(1, integrationB.remoteConfigCount)
+        assertEquals(0, integrationB.remoteConfigFailedCount)
+
+        sut.close()
+    }
+
+    @Test
+    fun `remote config reply from a closed setup does not reach integrations when the config is reused`() {
+        val integration = FakePostHogIntegration()
+        val release = CountDownLatch(1)
+        val http = heldFlagsResponse(release)
+
+        val sut = getSut(http.url("/").toString(), integration = integration)
+        http.takeRequest()
+
+        sut.close()
+        sut.setup(config)
+
+        release.countDown()
+        remoteConfigExecutor.shutdownAndAwaitTermination()
+
+        // only the second setup's own reply
+        assertEquals(1, integration.remoteConfigCount)
+        assertEquals(0, integration.remoteConfigFailedCount)
+
+        sut.close()
+    }
+
+    @Test
+    fun `remote config reply that arrives while open reaches integrations`() {
+        val integration = FakePostHogIntegration()
+        val release = CountDownLatch(1)
+        val http = heldFlagsResponse(release)
+
+        val sut = getSut(http.url("/").toString(), integration = integration)
+        http.takeRequest()
+
+        release.countDown()
         remoteConfigExecutor.shutdownAndAwaitTermination()
 
         assertEquals(1, integration.remoteConfigCount)
@@ -903,6 +1140,207 @@ internal class PostHogTest {
         assertFalse(theEvent.properties!!.containsKey("\$is_identified"))
 
         sut2.close()
+    }
+
+    @Test
+    fun `failed flag reads emit missing response and independent errors without defaults or duplicate events`() {
+        for (errorBit in listOf("true", "false", null)) {
+            val global = errorBit?.let { "\"errorsWhileComputingFlags\":$it," } ?: ""
+            val body = """{$global"requestId":"failed-request","flags":{
+                "checkout":{"key":"checkout","enabled":false,"failed":true,
+                    "metadata":{"id":1,"version":2,"payload":"\"placeholder\""},
+                    "reason":{"code":"error","description":"Evaluation failed"}},
+                "variant":{"key":"variant","enabled":true,"variant":"placeholder","failed":true,
+                    "metadata":{"id":2,"version":1,"payload":"\"placeholder\""}},
+                "disabled":{"key":"disabled","enabled":false,"metadata":{"id":3,"version":1}}
+            }}"""
+            val http = mockHttp(response = MockResponse().setBody(body))
+            http.enqueue(MockResponse().setBody("{}"))
+            val captured = CopyOnWriteArrayList<String>()
+            val cache = PostHogMemoryPreferences()
+            val sut =
+                getSut(http.url("/").toString(), preloadFeatureFlags = false, flushAt = 20, cachePreferences = cache, beforeSend = {
+                    captured.add(it.event)
+                    it
+                })
+            val loaded = CountDownLatch(1)
+            sut.reloadFeatureFlags { loaded.countDown() }
+            assertTrue(loaded.await(5, TimeUnit.SECONDS))
+            assertNotNull(http.takeRequest(5, TimeUnit.SECONDS))
+
+            assertNull(sut.getFeatureFlagResult("checkout", sendFeatureFlagEvent = false))
+            assertTrue(captured.isEmpty())
+            assertTrue(sut.isFeatureEnabled("checkout", defaultValue = true))
+            assertNull(sut.getFeatureFlagResult("checkout"))
+            assertEquals("default", sut.getFeatureFlag("checkout", defaultValue = "default"))
+            assertNull(sut.getFeatureFlagResult("variant"))
+            assertFalse(sut.isFeatureEnabled("disabled", defaultValue = true))
+            assertEquals(listOf("disabled"), sut.getAllFeatureFlags()?.map { it.key })
+            sut.flush()
+            queueExecutor.awaitExecution()
+            val request = assertNotNull(http.takeRequest(5, TimeUnit.SECONDS))
+            val batch = serializer.deserialize<PostHogBatchEvent>(request.body.unGzip().reader())
+            val events = batch.batch.filter { it.event == "\$feature_flag_called" }
+            assertEquals(3, events.size)
+            val props = events.first { it.properties?.get("\$feature_flag") == "checkout" }.properties.orEmpty()
+            assertEquals("", props["\$feature_flag_response"])
+            assertEquals("failed-request", props["\$feature_flag_request_id"])
+            assertEquals("Evaluation failed", props["\$feature_flag_reason"])
+            assertEquals(1, props["\$feature_flag_id"])
+            assertEquals(2, props["\$feature_flag_version"])
+            val errors = (props["\$feature_flag_error"] as String).split(",")
+            assertTrue("evaluation_failed" in errors)
+            assertFalse("flag_missing" in errors)
+            assertEquals(errorBit == "true", "errors_while_computing_flags" in errors)
+            val healthy = events.first { it.properties?.get("\$feature_flag") == "disabled" }.properties.orEmpty()
+            assertEquals(false, healthy["\$feature_flag_response"])
+            assertFalse((healthy["\$feature_flag_error"] as? String).orEmpty().contains("evaluation_failed"))
+            assertFalse(props.containsKey("\$feature/checkout"))
+            sut.close()
+
+            // SharedPreferences restores rich details as JSON maps, not FeatureFlag instances.
+            val details = cache.getValue(PostHogPreferences.FLAGS)!!
+            cache.setValue(PostHogPreferences.FLAGS, serializer.deserializeString(serializer.serializeObject(details)!!)!!)
+            http.enqueue(MockResponse().setBody("{}"))
+            val reopened =
+                getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, cachePreferences = cache)
+            assertTrue(reopened.isFeatureEnabled("checkout", defaultValue = true))
+            queueExecutor.awaitExecution()
+            val restoredRequest = assertNotNull(http.takeRequest(5, TimeUnit.SECONDS))
+            assertTrue(restoredRequest.path!!.contains("/batch"), "Offline reads must not reload flags")
+            val restoredBatch = serializer.deserialize<PostHogBatchEvent>(restoredRequest.body.unGzip().reader())
+            val restoredProps = restoredBatch.batch.first { it.event == "\$feature_flag_called" }.properties.orEmpty()
+            assertEquals("", restoredProps["\$feature_flag_response"])
+            assertEquals(props["\$feature_flag_error"], restoredProps["\$feature_flag_error"])
+            assertEquals("Evaluation failed", restoredProps["\$feature_flag_reason"])
+            reopened.close()
+            http.shutdown()
+        }
+    }
+
+    @Test
+    fun `scalar reads safely track failed metadata from JSON`() {
+        assertFailedMetadataReads(structuredFirst = false, reopen = false)
+    }
+
+    @Test
+    fun `structured reads safely track failed metadata from JSON`() {
+        assertFailedMetadataReads(structuredFirst = true, reopen = false)
+    }
+
+    @Test
+    fun `scalar reads safely track failed metadata after JSON cache reopen`() {
+        assertFailedMetadataReads(structuredFirst = false, reopen = true)
+    }
+
+    @Test
+    fun `structured reads safely track failed metadata after JSON cache reopen`() {
+        assertFailedMetadataReads(structuredFirst = true, reopen = true)
+    }
+
+    private fun assertFailedMetadataReads(
+        structuredFirst: Boolean,
+        reopen: Boolean,
+    ) {
+        for (errorBit in listOf("true", "false", null)) {
+            for (metadata in listOf("\"metadata\":null,", "")) {
+                val global = errorBit?.let { "\"errorsWhileComputingFlags\":$it," } ?: ""
+                val reason = if (metadata.isNotEmpty()) """, "reason":{"code":"error","description":"Evaluation failed"}""" else ""
+                val body = """{$global"requestId":"failed-request","evaluatedAt":123,"flags":{
+                    "checkout":{"key":"checkout","enabled":false,"failed":true,$metadata"variant":"placeholder"$reason},
+                    "disabled":{"key":"disabled","enabled":false,"metadata":{"id":2,"version":3,"has_experiment":false}},
+                    "healthy":{"key":"healthy","enabled":true,"variant":"blue",
+                        "metadata":{"id":3,"version":4,"payload":"\"good\""}}
+                }}"""
+                val http = mockHttp(response = MockResponse().setBody(body))
+                val cache = PostHogMemoryPreferences()
+                val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, flushAt = 20, cachePreferences = cache)
+                try {
+                    val loaded = CountDownLatch(1)
+                    sut.reloadFeatureFlags { loaded.countDown() }
+                    assertTrue(loaded.await(5, TimeUnit.SECONDS))
+                    assertTrue(assertNotNull(http.takeRequest(5, TimeUnit.SECONDS)).path!!.contains("/flags"))
+
+                    fun assertReads(client: PostHogInterface) {
+                        val requestsBefore = http.requestCount
+                        assertNull(client.getFeatureFlagResult("checkout", sendFeatureFlagEvent = false))
+                        assertEquals("default", client.getFeatureFlag("checkout", defaultValue = "default", sendFeatureFlagEvent = false))
+                        client.flush()
+                        queueExecutor.awaitExecution()
+                        assertEquals(requestsBefore, http.requestCount, "Suppressed reads must neither track nor fetch")
+
+                        if (structuredFirst) {
+                            assertNull(client.getFeatureFlagResult("checkout"))
+                        } else {
+                            assertEquals("default", client.getFeatureFlag("checkout", defaultValue = "default"))
+                        }
+                        assertNull(client.getFeatureFlagResult("checkout"))
+                        assertEquals("another-default", client.getFeatureFlag("checkout", defaultValue = "another-default"))
+                        assertFalse(client.isFeatureEnabled("disabled", defaultValue = true))
+                        val healthy = assertNotNull(client.getFeatureFlagResult("healthy"))
+                        assertEquals("blue", healthy.variant)
+                        assertEquals("good", healthy.payload)
+                        assertEquals(setOf("disabled", "healthy"), client.getAllFeatureFlags()?.map { it.key }?.toSet())
+                        http.enqueue(MockResponse().setBody("{}"))
+                        client.flush()
+                        queueExecutor.awaitExecution()
+                        val request = assertNotNull(http.takeRequest(5, TimeUnit.SECONDS))
+                        assertTrue(request.path!!.contains("/batch"), "Reads must not reload flags, including after reopen")
+                        val events = serializer.deserialize<PostHogBatchEvent>(request.body.unGzip().reader()).batch
+                        assertEquals(3, events.size, "Repeated missing-value reads deduplicate independently of caller defaults")
+                        val props = events.single { it.properties?.get("\$feature_flag") == "checkout" }.properties.orEmpty()
+                        assertEquals("", props["\$feature_flag_response"])
+                        assertEquals("failed-request", props["\$feature_flag_request_id"])
+                        assertEquals(123, props["\$feature_flag_evaluated_at"])
+                        assertEquals(if (reason.isEmpty()) "" else "Evaluation failed", props["\$feature_flag_reason"])
+                        val errors = (props["\$feature_flag_error"] as String).split(",").toSet()
+                        assertEquals(
+                            if (errorBit == "true") {
+                                setOf("evaluation_failed", "errors_while_computing_flags")
+                            } else {
+                                setOf("evaluation_failed")
+                            },
+                            errors,
+                        )
+                        for (field in listOf("id", "version", "has_experiment")) {
+                            assertFalse(props.containsKey("\$feature_flag_$field"), "Missing metadata must not invent $field")
+                        }
+                        val disabled = events.single { it.properties?.get("\$feature_flag") == "disabled" }.properties.orEmpty()
+                        assertEquals(false, disabled["\$feature_flag_response"])
+                        assertEquals(2, disabled["\$feature_flag_id"])
+                        assertEquals(3, disabled["\$feature_flag_version"])
+                        assertEquals(false, disabled["\$feature_flag_has_experiment"])
+                        assertFalse((disabled["\$feature_flag_error"] as? String).orEmpty().contains("evaluation_failed"))
+                        assertEquals(requestsBefore + 1, http.requestCount, "Only the explicit batch flush may make a request")
+                    }
+
+                    if (reopen) {
+                        sut.close()
+                        // SharedPreferences restores JSON maps; Gson omits null metadata on serialization.
+                        val details = assertNotNull(cache.getValue(PostHogPreferences.FLAGS))
+                        cache.setValue(PostHogPreferences.FLAGS, serializer.deserializeString(serializer.serializeObject(details)!!)!!)
+                        val reopened =
+                            getSut(
+                                http.url("/").toString(),
+                                preloadFeatureFlags = false,
+                                reloadFeatureFlags = false,
+                                flushAt = 20,
+                                cachePreferences = cache,
+                            )
+                        try {
+                            assertReads(reopened)
+                        } finally {
+                            reopened.close()
+                        }
+                    } else {
+                        assertReads(sut)
+                    }
+                } finally {
+                    sut.close()
+                    http.shutdown()
+                }
+            }
+        }
     }
 
     @Test
@@ -5087,6 +5525,150 @@ internal class PostHogTest {
 
         // Only one event should be sent since the content is the same
         assertEquals(1, http.requestCount)
+
+        sut.close()
+    }
+
+    @Test
+    fun `setPersonProperties resends an update that beforeSend dropped`() {
+        val http = mockHttp()
+        var setEvents = 0
+        val sut =
+            getSut(http.url("/").toString(), preloadFeatureFlags = false, beforeSend = {
+                if (it.event == "\$set" && ++setEvents == 1) null else it
+            })
+
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+        queueExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(1, http.requestCount)
+
+        sut.close()
+    }
+
+    @Test
+    fun `setPersonProperties resends an update that beforeSend made personless`() {
+        val http = mockHttp(total = 2)
+        var setEvents = 0
+        val sut =
+            getSut(http.url("/").toString(), preloadFeatureFlags = false, beforeSend = {
+                if (it.event == "\$set" && ++setEvents == 1) it.properties!!["\$process_person_profile"] = false
+                it
+            })
+
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+
+        queueExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(2, http.requestCount)
+        val flags =
+            List(2) {
+                serializer.deserialize<PostHogBatchEvent>(http.takeRequest().body.unGzip().reader())!!
+                    .batch.single().properties!!["\$process_person_profile"]
+            }
+        assertEquals(listOf<Any?>(false, true), flags)
+
+        sut.close()
+    }
+
+    @Test
+    fun `setPersonProperties sends an update made while opted out after opting in`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, optOut = true)
+
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+        sut.optIn()
+        sut.setPersonProperties(mapOf("email" to "user@example.com"))
+        queueExecutor.shutdownAndAwaitTermination()
+
+        assertEquals(1, http.requestCount)
+
+        sut.close()
+    }
+
+    @Test
+    fun `identify skips a set that repeats the properties its identify event sent`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, flushAt = 2)
+
+        sut.identify(DISTINCT_ID, userProperties = userProps)
+        sut.identify(DISTINCT_ID, userProperties = userProps)
+        sut.setPersonProperties(mapOf("plan" to "pro"))
+
+        val events = capturedEvents(http)
+        assertEquals(listOf("\$identify", "\$set"), events.map { it.event })
+        assertEquals(mapOf("plan" to "pro"), events[1].properties!!["\$set"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `identify resends set properties that beforeSend removed from the identify event`() {
+        val http = mockHttp()
+        val sut =
+            getSut(
+                http.url("/").toString(),
+                preloadFeatureFlags = false,
+                reloadFeatureFlags = false,
+                flushAt = 2,
+                beforeSend = {
+                    if (it.event == "\$identify") it.properties!!.remove("\$set")
+                    it
+                },
+            )
+
+        sut.identify(DISTINCT_ID, userProperties = userProps)
+        sut.setPersonProperties(userProps)
+        sut.flush()
+
+        val events = capturedEvents(http)
+        assertEquals(listOf("\$identify", "\$set"), events.map { it.event })
+        assertEquals(userProps, events[1].properties!!["\$set"])
+
+        sut.close()
+    }
+
+    @Test
+    fun `identify with a person property the hash cannot serialize still identifies`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+
+        sut.identify(DISTINCT_ID, userProperties = mapOf("score" to Double.NaN))
+
+        assertEquals(DISTINCT_ID, sut.distinctId())
+
+        sut.close()
+    }
+
+    @Test
+    fun `identify with person properties too deeply nested to hash still identifies`() {
+        val http = mockHttp()
+        val sut = getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false)
+        var nested: Map<String, Any> = mapOf("leaf" to 1)
+        repeat(100_000) { nested = mapOf("child" to nested) }
+
+        sut.identify(DISTINCT_ID, userProperties = nested)
+
+        assertEquals(DISTINCT_ID, sut.distinctId())
+
+        sut.close()
+    }
+
+    @Test
+    fun `setPersonProperties sends every update the hash cannot serialize`() {
+        val http = mockHttp()
+        val sut =
+            getSut(http.url("/").toString(), preloadFeatureFlags = false, reloadFeatureFlags = false, flushAt = 2)
+
+        sut.setPersonProperties(mapOf("score" to Double.NaN, "plan" to 1))
+        sut.setPersonProperties(mapOf("score" to Double.NaN, "plan" to "1"))
+        sut.flush()
+
+        val events = capturedEvents(http)
+        assertEquals(listOf("\$set", "\$set"), events.map { it.event })
+        assertEquals("1", events[1].properties!!["\$set"].let { it as Map<*, *> }["plan"])
 
         sut.close()
     }

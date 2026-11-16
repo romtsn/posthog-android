@@ -211,6 +211,10 @@ public open class PostHogStateless protected constructor(
             props.putAll(it)
         }
 
+        if (config?.disableGeoIp == true) {
+            props["\$geoip_disable"] = true
+        }
+
         return props
     }
 
@@ -570,7 +574,10 @@ public open class PostHogStateless protected constructor(
         if (!isEnabled()) return defaultValue
         val result = featureFlags?.getFeatureFlagResult(key, distinctId, groups, personProperties, groupProperties)
         val flagValue = result?.value ?: defaultValue
-        sendFeatureFlagCalled(distinctId, key, flagValue, groups, personProperties, groupProperties)
+        val failed =
+            result == null &&
+                featureFlags?.getFeatureFlagDetails(key, distinctId, groups, personProperties, groupProperties)?.failed == true
+        sendFeatureFlagCalled(distinctId, key, if (failed) null else flagValue, groups, personProperties, groupProperties)
         return flagValue
     }
 
@@ -790,6 +797,7 @@ public open class PostHogStateless protected constructor(
                 "locally_evaluated",
                 "\$groups",
                 "\$process_person_profile",
+                "\$geoip_disable",
                 "\$session_id",
                 "\$window_id",
                 "\$lib",

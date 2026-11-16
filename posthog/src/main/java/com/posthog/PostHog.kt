@@ -52,6 +52,10 @@ import java.util.concurrent.Executors
 
 private const val PUSH_NOTIFICATION_OPENED_EVENT = "\$push_notification_opened"
 private const val MAX_DEBUG_ERROR_LENGTH = 500
+
+// Stands in for the hash of a person-properties update that cannot be serialized: such an update
+// is always sent and never cached, as no real hash is empty.
+private const val UNHASHABLE_PERSON_PROPERTIES = ""
 private const val REPLAY_DEBUG_PROPERTIES_INTERVAL_MILLIS = 30_000L
 
 // Kept on every event because the app reads them per event; the rest of the replay debug bundle is throttled.
@@ -253,6 +257,9 @@ public class PostHog private constructor(
                         EndpointSpec.logs(config, api, config.logsStoragePrefix),
                         logsExecutor,
                     )
+                // the loader this setup builds below, so its replies can be told apart from a later
+                // setup's even when the same config object is reused after close()
+                var loader: PostHogRemoteConfig? = null
                 val onRemoteConfigLoaded =
                     PostHogOnRemoteConfigLoaded {
                         // The callback fires whether the attempt succeeded or terminally failed;
@@ -287,9 +294,9 @@ public class PostHog private constructor(
                             }
 
                             // Notify all integrations about remote config changes
-                            notifyIntegrationsRemoteConfig(config, loaded = true)
+                            notifyIntegrationsRemoteConfig(config, loader, loaded = true)
                         } else {
-                            notifyIntegrationsRemoteConfig(config, loaded = false)
+                            notifyIntegrationsRemoteConfig(config, loader, loaded = false)
                         }
                     }
 
@@ -347,6 +354,7 @@ public class PostHog private constructor(
 
                 if (featureFlags is PostHogRemoteConfig) {
                     config.remoteConfigHolder = featureFlags
+                    loader = featureFlags
                 }
 
                 config.addIntegration(sendCachedEventsIntegration)
@@ -427,12 +435,14 @@ public class PostHog private constructor(
 
     private fun notifyIntegrationsRemoteConfig(
         config: PostHogConfig,
+        loader: PostHogRemoteConfig?,
         loaded: Boolean,
     ) {
-        // under setupLock so it can't interleave with optOut/optIn, where some integrations would
-        // otherwise reinstall themselves while opted out
+        // under setupLock so it can't interleave with close/optOut/optIn, where some integrations
+        // would otherwise reinstall themselves on a closed or opted-out client, and a reply from
+        // a closed setup can't re-arm its integrations once the client is set up again
         synchronized(setupLock) {
-            if (isOptedOut()) {
+            if (!isEnabled() || isOptedOut() || config !== this.config || loader !== remoteConfig) {
                 return
             }
             config.integrations.forEach { integration ->
@@ -827,6 +837,9 @@ public class PostHog private constructor(
         if (appendSharedProps) {
             props["\$is_identified"] = isIdentified
             props["\$process_person_profile"] = hasPersonProcessing()
+            if (config?.disableGeoIp == true) {
+                props["\$geoip_disable"] = true
+            }
         }
 
         // After the caller merge so SDK-computed debug values win, matching posthog-js's
@@ -962,6 +975,23 @@ public class PostHog private constructor(
         groups: Map<String, String>?,
         timestamp: Date?,
     ) {
+        captureEvent(event, distinctId, properties, userProperties, userPropertiesSetOnce, groups, timestamp)
+    }
+
+    /**
+     * [personPropertiesHash], when set, is recorded or cleared once the event is queued, from the
+     * event as sent; see [updatePersonPropertiesHashForQueuedEvent].
+     */
+    private fun captureEvent(
+        event: String,
+        distinctId: String?,
+        properties: Map<String, Any>?,
+        userProperties: Map<String, Any>?,
+        userPropertiesSetOnce: Map<String, Any>?,
+        groups: Map<String, String>?,
+        timestamp: Date?,
+        personPropertiesHash: String? = null,
+    ) {
         // Tracked on this call rather than derived from the event, so it survives beforeSend renaming
         // or replacing the event.
         var claimedReplayDebugBundle = false
@@ -1072,6 +1102,9 @@ public class PostHog private constructor(
                     queue.add(postHogEvent)
                     if (claimedReplayDebugBundle) {
                         commitReplayDebugPropertiesWindow()
+                    }
+                    if (personPropertiesHash != null) {
+                        updatePersonPropertiesHashForQueuedEvent(event, postHogEvent, personPropertiesHash)
                     }
                 }
                 // Notify surveys integration about the event
@@ -1376,7 +1409,7 @@ public class PostHog private constructor(
                 // install re-arms each integration from local config; re-apply the cached remote
                 // config (e.g. exception autocapture turned off remotely) instead of waiting for a reload
                 if (remoteConfig?.hasRemoteConfigFetched() == true) {
-                    config?.let { notifyIntegrationsRemoteConfig(it, loaded = true) }
+                    config?.let { notifyIntegrationsRemoteConfig(it, remoteConfig, loaded = true) }
                 }
             }
         }
@@ -1640,12 +1673,17 @@ public class PostHog private constructor(
         if (shouldIdentify || shouldTransitionToIdentified) config.notifyIntegrationsChanged()
 
         if (shouldIdentify) {
-            capture(
+            captureEvent(
                 PostHogEventName.IDENTIFY.event,
                 distinctId = distinctId,
                 properties = props,
                 userProperties = userProperties,
                 userPropertiesSetOnce = userPropertiesSetOnce,
+                groups = null,
+                timestamp = null,
+                personPropertiesHash =
+                    getPersonPropertiesHash(distinctId, userProperties, userPropertiesSetOnce)
+                        ?: UNHASHABLE_PERSON_PROPERTIES,
             )
 
             if (config?.reuseAnonymousId != true) {
@@ -1680,18 +1718,20 @@ public class PostHog private constructor(
 
             setPersonPropertiesForFlagsIfNeeded(userProperties, userPropertiesSetOnce)
 
-            capture(
+            // The transition event must fire even when an identical property call was cached
+            // earlier, so it skips the duplicate check and only records the hash once queued.
+            captureEvent(
                 PostHogEventName.SET.event,
                 distinctId = distinctId,
+                properties = null,
                 userProperties = userProperties ?: emptyMap(),
                 userPropertiesSetOnce = userPropertiesSetOnce ?: emptyMap(),
+                groups = null,
+                timestamp = null,
+                personPropertiesHash =
+                    getPersonPropertiesHash(distinctId, userProperties, userPropertiesSetOnce)
+                        ?: UNHASHABLE_PERSON_PROPERTIES,
             )
-
-            // The transition event must fire even when an identical property call was cached
-            // earlier; cache only after capture so deduplication cannot suppress it.
-            synchronized(cachedPersonPropertiesLock) {
-                cachedPersonPropertiesHash = getPersonPropertiesHash(distinctId, userProperties, userPropertiesSetOnce)
-            }
 
             // The identified state itself is not part of the flags request; reload only when the
             // caller supplied properties that can affect flag evaluation.
@@ -1699,18 +1739,23 @@ public class PostHog private constructor(
                 reloadFeatureFlags(config?.onFeatureFlags)
             }
         } else if (!hasDifferentDistinctId && (userProperties?.isNotEmpty() == true || userPropertiesSetOnce?.isNotEmpty() == true)) {
-            if (shouldCapturePersonPropertiesEvent(
+            val hash =
+                personPropertiesHashIfChanged(
                     distinctId,
                     userProperties,
                     userPropertiesSetOnce,
                     "A duplicate identify call was made with the same properties. The \$set event has been ignored.",
                 )
-            ) {
-                capture(
+            if (hash != null) {
+                captureEvent(
                     PostHogEventName.SET.event,
                     distinctId = distinctId,
+                    properties = null,
                     userProperties = userProperties,
                     userPropertiesSetOnce = userPropertiesSetOnce,
+                    groups = null,
+                    timestamp = null,
+                    personPropertiesHash = hash,
                 )
             }
             // Note we don't reload flags on property changes as these get processed async
@@ -1737,15 +1782,13 @@ public class PostHog private constructor(
 
         val currentDistinctId = this.distinctId
 
-        if (!shouldCapturePersonPropertiesEvent(
+        val hash =
+            personPropertiesHashIfChanged(
                 currentDistinctId,
                 userPropertiesToSet,
                 userPropertiesToSetOnce,
                 "A duplicate setPersonProperties call was made with the same properties. It has been ignored.",
-            )
-        ) {
-            return
-        }
+            ) ?: return
 
         // Update person properties for flags (setOnce properties are applied first, then set properties override)
         val allProperties = mutableMapOf<String, Any>()
@@ -1756,11 +1799,15 @@ public class PostHog private constructor(
         }
 
         // Send the $set event
-        capture(
+        captureEvent(
             PostHogEventName.SET.event,
             distinctId = currentDistinctId,
+            properties = null,
             userProperties = userPropertiesToSet,
             userPropertiesSetOnce = userPropertiesToSetOnce,
+            groups = null,
+            timestamp = null,
+            personPropertiesHash = hash,
         )
     }
 
@@ -1773,42 +1820,84 @@ public class PostHog private constructor(
         distinctId: String,
         userPropertiesToSet: Map<String, Any>?,
         userPropertiesToSetOnce: Map<String, Any>?,
-    ): String {
-        // Sort keys recursively to ensure deterministic hashing regardless of map insertion order
-        val sortedSet = userPropertiesToSet?.let { sortMapRecursively(it) }
-        val sortedSetOnce = userPropertiesToSetOnce?.let { sortMapRecursively(it) }
+    ): String? {
+        // Gson throws on values such as Double.NaN, and deeply nested properties can overflow the
+        // recursive sort. A string fallback could equate different values (1 and "1"), so an update
+        // that cannot be hashed has no hash and is never deduplicated.
+        return try {
+            // Sort keys recursively to ensure deterministic hashing regardless of map insertion order.
+            // An empty map hashes like a missing one, as both send no properties.
+            val sortedSet = userPropertiesToSet?.takeIf { it.isNotEmpty() }?.let { sortMapRecursively(it) }
+            val sortedSetOnce = userPropertiesToSetOnce?.takeIf { it.isNotEmpty() }?.let { sortMapRecursively(it) }
 
-        // Create a consistent JSON-like string representation similar to JS SDK's jsonStringify
-        val hashData =
-            sortedMapOf(
-                "distinct_id" to distinctId,
-                "userPropertiesToSet" to sortedSet,
-                "userPropertiesToSetOnce" to sortedSetOnce,
-            )
-        return config?.serializer?.serializeObject(hashData) ?: hashData.toString()
+            // Create a consistent JSON-like string representation similar to JS SDK's jsonStringify
+            val hashData =
+                sortedMapOf(
+                    "distinct_id" to distinctId,
+                    "userPropertiesToSet" to sortedSet,
+                    "userPropertiesToSetOnce" to sortedSetOnce,
+                )
+            config?.serializer?.serializeObject(hashData)
+        } catch (e: Throwable) {
+            config?.logger?.log("Failed to hash person properties for deduplication: $e.")
+            null
+        }
     }
 
     /**
-     * Checks if person properties have changed by comparing hash values.
-     * Updates the cached hash if different and returns true if the event should be captured.
-     * Returns false if the hash matches (duplicate call), logging the provided message.
+     * Returns the hash of this person-properties update, or null when it matches the last update
+     * that was queued (a duplicate call), logging the provided message. The hash is not stored here:
+     * [updatePersonPropertiesHashForQueuedEvent] stores it once the event is queued.
      */
-    private fun shouldCapturePersonPropertiesEvent(
+    private fun personPropertiesHashIfChanged(
         distinctId: String,
         userPropertiesToSet: Map<String, Any>?,
         userPropertiesToSetOnce: Map<String, Any>?,
         duplicateLogMessage: String,
-    ): Boolean {
-        val hash = getPersonPropertiesHash(distinctId, userPropertiesToSet, userPropertiesToSetOnce)
+    ): String? {
+        val hash =
+            getPersonPropertiesHash(distinctId, userPropertiesToSet, userPropertiesToSetOnce)
+                ?: return UNHASHABLE_PERSON_PROPERTIES
 
         synchronized(cachedPersonPropertiesLock) {
             if (cachedPersonPropertiesHash == hash) {
                 config?.logger?.log(duplicateLogMessage)
-                return false
+                return null
             }
-            cachedPersonPropertiesHash = hash
         }
-        return true
+        return hash
+    }
+
+    /**
+     * Runs once [queuedEvent] is queued; a dropped event leaves the hash alone. The event as sent,
+     * after `beforeSend`, decides: an update that keeps its name, its distinct id and its `$set` and
+     * `$set_once` payload, and whose `$process_person_profile` is missing or the Boolean `true`, surely
+     * processes the person, so its hash is recorded. Anything else may not have sent these properties
+     * to the person, so the hash is cleared and a later identical update is sent.
+     */
+    private fun updatePersonPropertiesHashForQueuedEvent(
+        capturedEvent: String,
+        queuedEvent: PostHogEvent,
+        hash: String,
+    ) {
+        val processPersonProfile = queuedEvent.properties?.get("\$process_person_profile")
+        val surelyProcessesPerson =
+            hash != UNHASHABLE_PERSON_PROPERTIES &&
+                queuedEvent.event == capturedEvent &&
+                (processPersonProfile == null || processPersonProfile == true) &&
+                sentPersonPropertiesHash(queuedEvent) == hash
+        synchronized(cachedPersonPropertiesLock) {
+            cachedPersonPropertiesHash = if (surelyProcessesPerson) hash else null
+        }
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun sentPersonPropertiesHash(queuedEvent: PostHogEvent): String? {
+        val properties = queuedEvent.properties
+        val set = properties?.get("\$set")
+        val setOnce = properties?.get("\$set_once")
+        if ((set != null && set !is Map<*, *>) || (setOnce != null && setOnce !is Map<*, *>)) return null
+        return getPersonPropertiesHash(queuedEvent.distinctId, set as Map<String, Any>?, setOnce as Map<String, Any>?)
     }
 
     private fun hasPersonProcessing(): Boolean {
@@ -2055,15 +2144,19 @@ public class PostHog private constructor(
                     props["\$feature_flag"] = key
                     // value should never be nullabe anyway
                     props["\$feature_flag_response"] = value ?: ""
+                    it.getFlagError(key)?.let { error -> props["\$feature_flag_error"] = error }
                     requestId?.let { props["\$feature_flag_request_id"] = it }
                     evaluatedAt?.let { props["\$feature_flag_evaluated_at"] = it }
                     flagDetails?.let {
-                        props["\$feature_flag_id"] = it.metadata.id
-                        props["\$feature_flag_version"] = it.metadata.version
-                        props["\$feature_flag_reason"] = it.reason?.description ?: ""
-                        it.metadata.hasExperiment?.let { hasExperiment ->
-                            props["\$feature_flag_has_experiment"] = hasExperiment
+                        // Gson can hydrate retained failed records without the non-null metadata object.
+                        it.metadata?.let { metadata ->
+                            props["\$feature_flag_id"] = metadata.id
+                            props["\$feature_flag_version"] = metadata.version
+                            metadata.hasExperiment?.let { hasExperiment ->
+                                props["\$feature_flag_has_experiment"] = hasExperiment
+                            }
                         }
+                        props["\$feature_flag_reason"] = it.reason?.description ?: ""
                     }
                     // Snapshot the three bootstrap fields under one lock so a concurrent reset()
                     // can't tear this event (a response present but its payload dropped, or a
@@ -2092,8 +2185,10 @@ public class PostHog private constructor(
         sendFeatureFlagEvent: Boolean?,
     ): Any? {
         if (!isEnabled()) return defaultValue
-        val flagValue = remoteConfig?.getFeatureFlagResult(key)?.value ?: defaultValue
-        sendFeatureFlagCalled(key, flagValue, sendFeatureFlagEvent)
+        val result = remoteConfig?.getFeatureFlagResult(key)
+        val flagValue = result?.value ?: defaultValue
+        val eventValue = if (result == null && remoteConfig?.getFlagDetails(key)?.failed == true) null else flagValue
+        sendFeatureFlagCalled(key, eventValue, sendFeatureFlagEvent)
         return flagValue
     }
 
